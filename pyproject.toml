@@ -1,7 +1,7 @@
 [project]
 name = "gemini-stock"
 version = "0.1.0"
-description = "US stock AI watchlist and alert assistant for SPY and QQQ."
+description = "US stock AI watchlist and alert assistant for CONL, TSLL, SPY, and QQQ."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi==0.136.1",

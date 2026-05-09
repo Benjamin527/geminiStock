@@ -71,34 +71,30 @@ class RuleBasedFallbackAnalyzer:
 
     def analyze_json_only(self, analysis_input: TechnicalAnalysisInput) -> GeminiSignal:
         score = 0.0
-        setup_type = "no_trade"
         bias = "neutral"
-        should_alert = False
         rsi = analysis_input.rsi_14
         if rsi is not None and rsi < 35 and analysis_input.last_price >= (analysis_input.ema_50 or analysis_input.last_price) - 2 * (analysis_input.atr_14 or 0):
             score = 7.2
-            setup_type = "bullish_reversal"
             bias = "bullish"
-            should_alert = True
         return GeminiSignal(
             symbol=analysis_input.symbol,
             timestamp_utc=analysis_input.timestamp_utc,
             analysis_level="json_only",
             bias=bias,  # type: ignore[arg-type]
             sentiment_score=score,
-            confidence=0.66 if should_alert else 0.4,
-            setup_type=setup_type,  # type: ignore[arg-type]
+            confidence=0.45,
+            setup_type="no_trade",
             visual_confirmation="not_applicable",
-            should_alert=should_alert,
+            should_alert=False,
             entry_zone=[analysis_input.last_price * 0.995, analysis_input.last_price * 1.005],
             stop_loss=analysis_input.last_price - 1.5 * (analysis_input.atr_14 or 0),
             take_profit=[
                 analysis_input.last_price + 2.0 * (analysis_input.atr_14 or 0),
                 analysis_input.last_price + 2.5 * (analysis_input.atr_14 or 0),
             ],
-            risk_reward_ratio=1.6 if should_alert else 0.0,
-            reasons=["Offline fallback generated a deterministic placeholder signal from Python indicators."],
-            risk_warnings=["Gemini API key is not configured, so no LLM reasoning was performed."],
+            risk_reward_ratio=0.0,
+            reasons=["Offline fallback generated a conservative watch-only signal from Python indicators."],
+            risk_warnings=["LLM analysis was unavailable, so this fallback cannot trigger trade alerts."],
         )
 
     def review_multimodal(

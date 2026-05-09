@@ -61,6 +61,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS llm_outputs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
+                    analysis_level TEXT,
+                    snapshot_timestamp_utc TEXT,
+                    has_image INTEGER NOT NULL DEFAULT 0,
                     input_json TEXT NOT NULL,
                     output_json TEXT,
                     error TEXT,
@@ -71,10 +74,84 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
                     channel TEXT NOT NULL,
+                    event_key TEXT,
+                    alert_type TEXT,
                     payload_json TEXT NOT NULL,
                     created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 );
                 """
+            )
+            self._ensure_column(conn, "llm_outputs", "analysis_level", "TEXT")
+            self._ensure_column(conn, "llm_outputs", "snapshot_timestamp_utc", "TEXT")
+            self._ensure_column(conn, "llm_outputs", "has_image", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "alerts", "event_key", "TEXT")
+            self._ensure_column(conn, "alerts", "alert_type", "TEXT")
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_raw_candles_symbol_interval_timestamp
+                    ON raw_candles(symbol, interval, timestamp_utc DESC);
+                CREATE INDEX IF NOT EXISTS idx_features_symbol_timestamp
+                    ON features(symbol, timestamp_utc DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_outputs_symbol_snapshot
+                    ON llm_outputs(symbol, snapshot_timestamp_utc DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_outputs_symbol_created
+                    ON llm_outputs(symbol, created_at_utc DESC);
+                CREATE INDEX IF NOT EXISTS idx_alerts_channel_event_key
+                    ON alerts(channel, event_key);
+                CREATE INDEX IF NOT EXISTS idx_alerts_symbol_channel_type_created
+                    ON alerts(symbol, channel, alert_type, created_at_utc DESC);
+                """
+            )
+            self._backfill_llm_metadata(conn)
+            self._backfill_alert_metadata(conn)
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _backfill_alert_metadata(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, payload_json
+            FROM alerts
+            WHERE event_key IS NULL OR alert_type IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            event_key, alert_type = _extract_alert_metadata(row["payload_json"])
+            conn.execute(
+                """
+                UPDATE alerts
+                SET event_key = COALESCE(event_key, ?),
+                    alert_type = COALESCE(alert_type, ?)
+                WHERE id = ?
+                """,
+                (event_key, alert_type, row["id"]),
+            )
+
+    @staticmethod
+    def _backfill_llm_metadata(conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, input_json
+            FROM llm_outputs
+            WHERE analysis_level IS NULL OR snapshot_timestamp_utc IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            analysis_level, snapshot_timestamp, has_image = _extract_llm_metadata(row["input_json"])
+            conn.execute(
+                """
+                UPDATE llm_outputs
+                SET analysis_level = COALESCE(analysis_level, ?),
+                    snapshot_timestamp_utc = COALESCE(snapshot_timestamp_utc, ?),
+                    has_image = ?
+                WHERE id = ?
+                """,
+                (analysis_level, snapshot_timestamp, has_image, row["id"]),
             )
 
     def save_candles(self, candles: Iterable[Candle]) -> None:
@@ -148,14 +225,19 @@ class Database:
         output_payload: dict[str, Any] | None,
         error: str | None,
     ) -> None:
+        snapshot_timestamp = _extract_snapshot_timestamp(input_payload)
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO llm_outputs (symbol, input_json, output_json, error)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO llm_outputs
+                    (symbol, analysis_level, snapshot_timestamp_utc, has_image, input_json, output_json, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
+                    input_payload.get("analysis_level"),
+                    snapshot_timestamp,
+                    1 if input_payload.get("has_image") else 0,
                     json.dumps(input_payload, ensure_ascii=False, default=str),
                     json.dumps(output_payload, ensure_ascii=False, default=str) if output_payload is not None else None,
                     error,
@@ -166,32 +248,30 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO alerts (symbol, channel, payload_json)
-                VALUES (?, ?, ?)
+                INSERT INTO alerts (symbol, channel, event_key, alert_type, payload_json)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (symbol, channel, json.dumps(payload, ensure_ascii=False, default=str)),
+                (
+                    symbol,
+                    channel,
+                    payload.get("event_key"),
+                    payload.get("type"),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                ),
             )
 
     def has_alert_event(self, channel: str, event_key: str) -> bool:
         with self.connect() as conn:
-            rows = conn.execute(
+            row = conn.execute(
                 """
-                SELECT payload_json
+                SELECT 1
                 FROM alerts
-                WHERE channel = ?
-                ORDER BY id DESC
-                LIMIT 200
+                WHERE channel = ? AND event_key = ?
+                LIMIT 1
                 """,
-                (channel,),
-            ).fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(row["payload_json"])
-            except Exception:
-                continue
-            if payload.get("event_key") == event_key:
-                return True
-        return False
+                (channel, event_key),
+            ).fetchone()
+        return row is not None
 
     def has_recent_alert_type(
         self,
@@ -203,51 +283,37 @@ class Database:
     ) -> bool:
         cutoff = now.astimezone(timezone.utc) - timedelta(minutes=within_minutes)
         with self.connect() as conn:
-            rows = conn.execute(
+            row = conn.execute(
                 """
-                SELECT payload_json, created_at_utc
+                SELECT 1
                 FROM alerts
-                WHERE symbol = ? AND channel = ?
-                ORDER BY id DESC
-                LIMIT 200
+                WHERE symbol = ? AND channel = ? AND alert_type = ? AND created_at_utc >= ?
+                LIMIT 1
                 """,
-                (symbol, channel),
-            ).fetchall()
-        for row in rows:
-            created_at = _parse_datetime(row["created_at_utc"])
-            if created_at is None or created_at < cutoff:
-                continue
-            try:
-                payload = json.loads(row["payload_json"])
-            except Exception:
-                continue
-            if payload.get("type") == alert_type:
-                return True
-        return False
+                (symbol, channel, alert_type, cutoff.isoformat()),
+            ).fetchone()
+        return row is not None
 
     def get_successful_signal_for_snapshot(self, symbol: str, snapshot_timestamp: datetime) -> GeminiSignal | None:
-        expected = snapshot_timestamp.astimezone(timezone.utc)
+        expected = snapshot_timestamp.astimezone(timezone.utc).isoformat()
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT input_json, output_json
+                SELECT output_json
                 FROM llm_outputs
-                WHERE symbol = ? AND output_json IS NOT NULL AND (error IS NULL OR error = '')
+                WHERE symbol = ?
+                    AND snapshot_timestamp_utc = ?
+                    AND output_json IS NOT NULL
+                    AND (error IS NULL OR error = '')
                 ORDER BY id DESC
-                LIMIT 100
+                LIMIT 1
                 """,
-                (symbol,),
+                (symbol, expected),
             ).fetchall()
         for row in rows:
             try:
-                input_payload = json.loads(row["input_json"])
                 output_payload = json.loads(row["output_json"])
             except Exception:
-                continue
-            technical_snapshot = input_payload.get("technical_snapshot") or {}
-            timestamp = technical_snapshot.get("timestamp_utc")
-            parsed = _parse_datetime(timestamp) if timestamp else None
-            if parsed is None or parsed != expected:
                 continue
             return GeminiSignal.model_validate(output_payload)
         return None
@@ -322,3 +388,33 @@ def _parse_datetime(value: str) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _extract_snapshot_timestamp(input_payload: dict[str, Any]) -> str | None:
+    technical_snapshot = input_payload.get("technical_snapshot")
+    if isinstance(technical_snapshot, dict):
+        timestamp = technical_snapshot.get("timestamp_utc")
+        if timestamp:
+            parsed = _parse_datetime(str(timestamp))
+            return parsed.isoformat() if parsed else str(timestamp)
+    return None
+
+
+def _extract_alert_metadata(payload_json: str) -> tuple[str | None, str | None]:
+    try:
+        payload = json.loads(payload_json)
+    except Exception:
+        return None, None
+    return payload.get("event_key"), payload.get("type")
+
+
+def _extract_llm_metadata(input_json: str) -> tuple[str | None, str | None, int]:
+    try:
+        input_payload = json.loads(input_json)
+    except Exception:
+        return None, None, 0
+    return (
+        input_payload.get("analysis_level"),
+        _extract_snapshot_timestamp(input_payload),
+        1 if input_payload.get("has_image") else 0,
+    )

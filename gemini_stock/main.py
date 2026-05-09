@@ -47,6 +47,36 @@ class SymbolRunResult:
     candles_1m: pd.DataFrame
 
 
+@dataclass
+class RuntimeContext:
+    data_provider: object
+    news_provider: object
+    renderer: ChartRenderer
+    analyzer: object
+    fallback_analyzer: RuleBasedFallbackAnalyzer
+    notifiers: list[object]
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> RuntimeContext:
+        data_provider = (
+            YFinanceMarketDataProvider(settings.delayed_data_tolerance_minutes)
+            if settings.data_provider == "yfinance"
+            else create_market_data_provider(settings)
+        )
+        return cls(
+            data_provider=data_provider,
+            news_provider=NullNewsProvider(),
+            renderer=ChartRenderer(settings.chart_dir),
+            analyzer=create_analyzer(settings),
+            fallback_analyzer=RuleBasedFallbackAnalyzer(),
+            notifiers=[
+                TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id),
+                FeishuNotifier(settings.feishu_webhook_url),
+                WeComNotifier(settings.wecom_webhook_url),
+            ],
+        )
+
+
 def create_analyzer(settings: Settings):
     if settings.llm_provider == "openai":
         return OpenAICompatibleAnalyzer(settings.openai_api_key, settings.openai_base_url, settings.openai_model)
@@ -82,24 +112,13 @@ def run_symbol(
     db: Database,
     rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
     profile: str = "primary",
+    context: RuntimeContext | None = None,
 ) -> SymbolRunResult | None:
-    data_provider = (
-        YFinanceMarketDataProvider(settings.delayed_data_tolerance_minutes)
-        if settings.data_provider == "yfinance"
-        else create_market_data_provider(settings)
-    )
-    news_provider = NullNewsProvider()
-    renderer = ChartRenderer(settings.chart_dir)
-    analyzer = create_analyzer(settings)
-    notifiers = [
-        TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id),
-        FeishuNotifier(settings.feishu_webhook_url),
-        WeComNotifier(settings.wecom_webhook_url),
-    ]
+    runtime = context or RuntimeContext.from_settings(settings)
 
     logger.info("symbol_run_started", extra={"symbol": symbol})
-    candles_1m = data_provider.get_ohlcv(symbol, "1m", settings.yfinance_period_1m)
-    candles_15m = data_provider.get_ohlcv(symbol, "15m", settings.yfinance_period_15m)
+    candles_1m = runtime.data_provider.get_ohlcv(symbol, "1m", settings.yfinance_period_1m)
+    candles_15m = runtime.data_provider.get_ohlcv(symbol, "15m", settings.yfinance_period_15m)
     db.save_candles(candles_from_frame(symbol, "1m", candles_1m))
     db.save_candles(candles_from_frame(symbol, "15m", candles_15m))
 
@@ -113,7 +132,7 @@ def run_symbol(
             maybe_send_price_action_alerts(settings, db, symbol, existing_signal, candles_1m)
         return result
 
-    news = news_provider.get_news([symbol])
+    news = runtime.news_provider.get_news([symbol])
     db.save_news(news)
     news_summary = build_news_summary(news)
     technical_events = build_technical_events(candles_15m, snapshot)
@@ -130,8 +149,8 @@ def run_symbol(
     }
     try:
         level1_signal, fallback_error = analyze_json_only_with_fallback(
-            analyzer,
-            RuleBasedFallbackAnalyzer(),
+            runtime.analyzer,
+            runtime.fallback_analyzer,
             analysis_input,
             settings,
         )
@@ -146,7 +165,7 @@ def run_symbol(
 
     final_signal = level1_signal
     if profile == "primary" and is_strong_candidate(snapshot, analysis_input, technical_events, news, level1_signal):
-        image_path = renderer.render_simplified(symbol, candles_15m, snapshot)
+        image_path = runtime.renderer.render_simplified(symbol, candles_15m, snapshot)
         level2_input = {
             "analysis_level": "multimodal_review",
             "has_image": True,
@@ -159,7 +178,7 @@ def run_symbol(
             "simplified_chart_image_path": str(image_path),
         }
         try:
-            final_signal = analyzer.review_multimodal(analysis_input, level1_signal, image_path)
+            final_signal = runtime.analyzer.review_multimodal(analysis_input, level1_signal, image_path)
             db.save_llm_output(symbol, level2_input, final_signal.json_dict(), None)
         except GeminiAnalysisError as exc:
             db.save_llm_output(symbol, level2_input, None, str(exc))
@@ -183,7 +202,7 @@ def run_symbol(
     payload = decision.json_dict()
     payload["event_key"] = event_key
     payload["type"] = "benchmark_alert" if isinstance(rules, BenchmarkAlertRuleEngine) else "primary_alert"
-    for notifier in notifiers:
+    for notifier in runtime.notifiers:
         try:
             if not should_send_decision_alert(db, notifier.channel, decision, event_key, datetime.now(timezone.utc), settings.alert_cooldown_minutes):
                 logger.info("alert_skipped", extra={"symbol": symbol, "reason": "persistent_cooldown_or_duplicate", "channel": notifier.channel})
@@ -200,12 +219,13 @@ def run_symbol(
 def run_once(settings: Settings) -> None:
     db = Database(settings.database_path)
     db.initialize()
+    context = RuntimeContext.from_settings(settings)
     primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
     benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
     benchmark_results: list[SymbolRunResult] = []
     for symbol in settings.symbols:
         try:
-            run_symbol(symbol, settings, db, primary_rules, profile="primary")
+            run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context)
         except MarketDataError as exc:
             db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
             logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
@@ -213,7 +233,7 @@ def run_once(settings: Settings) -> None:
             logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
     for symbol in settings.benchmark_symbols:
         try:
-            result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark")
+            result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context)
             if result is not None:
                 benchmark_results.append(result)
         except MarketDataError as exc:

@@ -15,11 +15,11 @@ from gemini_stock.schemas import GeminiSignal, TechnicalSnapshot
 from gemini_stock.web.repository import (
     BEIJING,
     _expected_move,
-    _fetch_quote_snapshot,
     _format_price_range,
     _nearest_level_for_view,
     _outlook_note,
     _parse_datetime,
+    _stored_quote_snapshot,
     format_duration,
     to_beijing_time,
 )
@@ -103,7 +103,7 @@ class MySQLDashboardRepository:
             feature_payload = json.loads(feature["payload_json"]) if feature else {}
             llm_input = json.loads(llm["input_json"]) if llm else {}
             llm_output = json.loads(llm["output_json"]) if llm and llm["output_json"] else {}
-            quote = _fetch_quote_snapshot(symbol)
+            quote = _stored_quote_snapshot(feature_payload, latest_1m)
             states.append(
                 {
                     "symbol": symbol,
@@ -149,7 +149,8 @@ class MySQLDashboardRepository:
             llm = self._latest_row("llm_outputs", symbol)
             feature_payload = json.loads(feature["payload_json"]) if feature else {}
             llm_output = json.loads(llm["output_json"]) if llm and llm["output_json"] else {}
-            quote = _fetch_quote_snapshot(symbol)
+            latest_1m = self._latest_raw_candle(symbol, "1m")
+            quote = _stored_quote_snapshot(feature_payload, latest_1m)
             close = quote.get("regular_market_price") or feature_payload.get("close")
             forecast = None
             if feature_payload and llm_output:

@@ -101,7 +101,7 @@ class DashboardRepository:
             llm_input = self._json(llm, "input_json") if llm else {}
             llm_output = self._json(llm, "output_json") if llm and llm["output_json"] else {}
             chart = self._latest_chart(symbol)
-            quote = _fetch_quote_snapshot(symbol)
+            quote = _stored_quote_snapshot(feature_payload, latest_1m)
             states.append(
                 {
                     "symbol": symbol,
@@ -148,7 +148,8 @@ class DashboardRepository:
             llm = self._latest_row("llm_outputs", symbol)
             feature_payload = self._json(feature, "payload_json") if feature else {}
             llm_output = self._json(llm, "output_json") if llm and llm["output_json"] else {}
-            quote = _fetch_quote_snapshot(symbol)
+            latest_1m = self._latest_raw_candle(symbol, "1m")
+            quote = _stored_quote_snapshot(feature_payload, latest_1m)
             close = quote.get("regular_market_price") or feature_payload.get("close")
             forecast = None
             if feature_payload and llm_output:
@@ -427,6 +428,26 @@ def _fetch_quote_snapshot(symbol: str) -> dict[str, Any]:
         "post_market_time": _timestamp_from_epoch(info.get("postMarketTime")),
         "source": "yfinance_quote",
     }
+
+
+def _stored_quote_snapshot(feature_payload: dict[str, Any], latest_1m: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any]:
+    if latest_1m is not None:
+        return {
+            "regular_market_price": _safe_float(latest_1m["close"]),
+            "post_market_price": None,
+            "regular_market_time": latest_1m["timestamp_utc"],
+            "post_market_time": None,
+            "source": "stored_1m_candle",
+        }
+    if feature_payload:
+        return {
+            "regular_market_price": _safe_float(feature_payload.get("close")),
+            "post_market_price": None,
+            "regular_market_time": feature_payload.get("timestamp_utc"),
+            "post_market_time": None,
+            "source": "feature_snapshot",
+        }
+    return {}
 
 
 def _timestamp_from_epoch(value: Any) -> str | None:

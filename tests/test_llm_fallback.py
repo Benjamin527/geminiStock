@@ -50,6 +50,16 @@ def test_json_analysis_falls_back_to_rule_based_signal_when_enabled():
     assert "upstream timeout" in error
 
 
+def test_rule_based_fallback_does_not_emit_trade_alerts():
+    signal = RuleBasedFallbackAnalyzer().analyze_json_only(
+        _analysis_input().model_copy(update={"rsi_14": 25, "last_price": 100, "ema_50": 99, "atr_14": 1.5})
+    )
+
+    assert signal.should_alert is False
+    assert signal.setup_type == "no_trade"
+    assert signal.confidence <= 0.5
+
+
 def test_json_analysis_raises_when_fallback_is_disabled():
     with pytest.raises(GeminiAnalysisError):
         analyze_json_only_with_fallback(

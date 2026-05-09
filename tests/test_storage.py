@@ -98,3 +98,33 @@ def test_database_loads_successful_signal_for_same_snapshot_timestamp(tmp_path):
     assert loaded is not None
     assert loaded.symbol == "TSLL"
     assert loaded.entry_zone == [12.10, 12.20]
+
+
+def test_database_promotes_alert_event_key_to_indexed_column(tmp_path):
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+    db.save_alert("TSLL", {"type": "primary_alert", "event_key": "alert:TSLL:indexed"}, "feishu")
+
+    with db.connect() as conn:
+        row = conn.execute("SELECT event_key, alert_type FROM alerts WHERE symbol = ?", ("TSLL",)).fetchone()
+
+    assert row["event_key"] == "alert:TSLL:indexed"
+    assert row["alert_type"] == "primary_alert"
+
+
+def test_database_migrates_existing_alert_payload_metadata(tmp_path):
+    db_path = tmp_path / "signals.db"
+    db = Database(db_path)
+    db.initialize()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO alerts (symbol, channel, payload_json) VALUES (?, ?, ?)",
+            ("TSLL", "feishu", '{"type":"price_action","event_key":"price_action:old"}'),
+        )
+    db.initialize()
+
+    with db.connect() as conn:
+        row = conn.execute("SELECT event_key, alert_type FROM alerts WHERE symbol = ?", ("TSLL",)).fetchone()
+
+    assert row["event_key"] == "price_action:old"
+    assert row["alert_type"] == "price_action"

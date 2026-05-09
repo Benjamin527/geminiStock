@@ -4,7 +4,7 @@ import pandas as pd
 
 from gemini_stock.config import Settings
 from gemini_stock.features.snapshot import build_technical_snapshot
-from gemini_stock.main import run_symbol
+from gemini_stock.main import RuntimeContext, run_symbol
 from gemini_stock.rules.alert_rules import AlertRuleEngine
 from gemini_stock.schemas import GeminiSignal
 from gemini_stock.storage.db import Database
@@ -79,6 +79,9 @@ def test_run_symbol_reuses_existing_signal_for_same_15m_snapshot(monkeypatch, tm
     analyzer = FakeAnalyzer()
     monkeypatch.setattr("gemini_stock.main.YFinanceMarketDataProvider", FakeProvider)
     monkeypatch.setattr("gemini_stock.main.create_analyzer", lambda settings: analyzer)
+    context = RuntimeContext.from_settings(
+        Settings(database_path=tmp_path / "signals.db", chart_dir=tmp_path, feishu_webhook_url=None)
+    )
 
     result = run_symbol(
         "TSLL",
@@ -86,8 +89,33 @@ def test_run_symbol_reuses_existing_signal_for_same_15m_snapshot(monkeypatch, tm
         db,
         AlertRuleEngine(),
         profile="primary",
+        context=context,
     )
 
     assert result is not None
     assert result.signal.symbol == "TSLL"
     assert analyzer.calls == 0
+
+
+def test_runtime_context_reuses_analyzer_across_symbols(monkeypatch, tmp_path):
+    created = 0
+
+    class FakeProvider:
+        pass
+
+    class FakeAnalyzer:
+        pass
+
+    def fake_create_analyzer(settings):
+        nonlocal created
+        created += 1
+        return FakeAnalyzer()
+
+    monkeypatch.setattr("gemini_stock.main.create_market_data_provider", lambda settings: FakeProvider())
+    monkeypatch.setattr("gemini_stock.main.create_analyzer", fake_create_analyzer)
+
+    settings = Settings(data_provider="auto", database_path=tmp_path / "signals.db", chart_dir=tmp_path)
+    context = RuntimeContext.from_settings(settings)
+
+    assert context.analyzer is context.analyzer
+    assert created == 1

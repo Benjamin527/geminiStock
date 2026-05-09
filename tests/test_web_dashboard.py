@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
-from gemini_stock.schemas import GeminiSignal, TechnicalSnapshot
+from gemini_stock.schemas import Candle, GeminiSignal, TechnicalSnapshot
 from gemini_stock.storage.db import Database
 from gemini_stock.web.app import create_app
 from gemini_stock.web import repository as dashboard_repository
@@ -84,11 +84,22 @@ def _bearish_signal() -> GeminiSignal:
     )
 
 
-def test_dashboard_repository_returns_latest_symbol_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+def test_dashboard_repository_returns_latest_symbol_state(tmp_path):
     db = Database(tmp_path / "dashboard.db")
     db.initialize()
     db.save_feature(_snapshot())
+    db.save_candles([
+        Candle(
+            symbol="SPY",
+            interval="1m",
+            timestamp_utc=datetime(2026, 1, 5, 21, 0, tzinfo=timezone.utc),
+            open=101,
+            high=101.5,
+            low=100.8,
+            close=101.25,
+            volume=1000,
+        )
+    ])
     db.save_llm_output(
         "SPY",
         {"analysis_level": "json_only", "has_image": False, "technical_events": ["rsi_oversold"]},
@@ -101,9 +112,10 @@ def test_dashboard_repository_returns_latest_symbol_state(tmp_path, monkeypatch)
     assert state[0]["symbol"] == "SPY"
     assert state[0]["last_price"] == 101.25
     assert state[0]["regular_market_price"] == 101.25
-    assert state[0]["post_market_price"] == 101.6
+    assert state[0]["post_market_price"] is None
     assert state[0]["regular_market_time"] == "2026-01-06 05:00:00 北京时间"
-    assert state[0]["post_market_time"] == "2026-01-06 07:01:00 北京时间"
+    assert state[0]["post_market_time"] is None
+    assert state[0]["price_source"] == "stored_1m_candle"
     assert state[0]["analysis_level"] == "json_only"
     assert state[0]["has_image"] is False
     assert state[0]["sentiment_score"] == 6.8
@@ -112,6 +124,21 @@ def test_dashboard_repository_returns_latest_symbol_state(tmp_path, monkeypatch)
     assert state[0]["entry_zone"] == [99, 100]
     assert state[0]["stop_loss"] == 96
     assert state[0]["take_profit"] == [104, 106]
+
+
+def test_dashboard_repository_does_not_fetch_live_quotes_by_default(tmp_path, monkeypatch):
+    def fail_live_quote(symbol):
+        raise AssertionError("dashboard should not call live quotes")
+
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", fail_live_quote)
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot())
+
+    state = DashboardRepository(db.path, tmp_path).get_symbol_states(["SPY"])
+
+    assert state[0]["last_price"] == 100
+    assert state[0]["price_source"] == "feature_snapshot"
 
 
 def test_dashboard_page_shows_direction_and_targets_on_symbol_cards(tmp_path, monkeypatch):
