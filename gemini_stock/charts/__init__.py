@@ -1,0 +1,2 @@
+"""Chart rendering package."""
+

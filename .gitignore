@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.DS_Store
+*.egg-info/
+data/*.sqlite
+data/*.sqlite-*
+data/*.log
+data/*.pid
+charts/*.png
