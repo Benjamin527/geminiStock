@@ -144,6 +144,29 @@ def send_feishu_text(webhook_url: str | None, text: str, now_fn=None, bypass_qui
     return True
 
 
+def send_feishu_interactive_card(
+    webhook_url: str | None,
+    card: dict,
+    now_fn=None,
+    bypass_quiet_hours: bool = False,
+) -> bool:
+    if not webhook_url:
+        logger.info("feishu_not_configured")
+        return False
+    now_fn = now_fn or (lambda: datetime.now(BEIJING))
+    current = now_fn().astimezone(BEIJING)
+    if not bypass_quiet_hours and (current.time() >= time(23, 0) or current.time() < time(9, 0)):
+        logger.info("feishu_quiet_hours_active", extra={"beijing_time": current.isoformat()})
+        return False
+    response = requests.post(
+        webhook_url,
+        json={"msg_type": "interactive", "card": card},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return True
+
+
 class TelegramNotifier:
     channel = "telegram"
 

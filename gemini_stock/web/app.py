@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from gemini_stock.config import load_settings
+from gemini_stock.rules.trade_plan import has_actionable_trade_levels
+from gemini_stock.storage.db import Database
 from gemini_stock.web.mysql_repository import MySQLDashboardRepository
 from gemini_stock.web.repository import DashboardRepository, utc_now_iso
 
@@ -20,36 +23,67 @@ def create_app(
     settings = load_settings()
     db_path = Path(database_path or settings.database_path)
     charts = Path(chart_dir or settings.chart_dir)
-    selected_symbols = settings.symbols if symbols is None else symbols
-    selected_benchmarks = settings.benchmark_symbols if benchmark_symbols is None else benchmark_symbols
     app = FastAPI(title="Gemini Stock Dashboard")
     charts.mkdir(parents=True, exist_ok=True)
     app.mount("/charts", StaticFiles(directory=charts), name="charts")
     repo = MySQLDashboardRepository(settings, charts) if settings.dashboard_data_source == "mysql" else DashboardRepository(db_path, charts)
+    db = Database(db_path) if settings.dashboard_data_source != "mysql" else None
+    if db is not None:
+        db.initialize()
+
+    def selected_symbols() -> list[str]:
+        if symbols is not None:
+            return symbols
+        if db is not None:
+            dynamic = db.list_watch_symbols("primary")
+            if dynamic:
+                return dynamic
+        return settings.symbols
+
+    def selected_benchmarks() -> list[str]:
+        if benchmark_symbols is not None:
+            return benchmark_symbols
+        if db is not None:
+            dynamic = db.list_watch_symbols("benchmark")
+            if dynamic:
+                return dynamic
+        return settings.benchmark_symbols
+
+    def watchlist_payload() -> dict[str, list[str]]:
+        return {
+            "primary": selected_symbols(),
+            "benchmark": selected_benchmarks(),
+        }
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
+        symbols_now = selected_symbols()
+        benchmarks_now = selected_benchmarks()
         return render_dashboard(
             status=repo.get_status(),
-            metrics=repo.get_today_metrics(selected_symbols),
-            symbols=repo.get_symbol_states(selected_symbols),
-            benchmarks=repo.get_benchmark_states(selected_benchmarks),
-            llm_outputs=repo.get_recent_llm_outputs(selected_symbols),
-            alerts=repo.get_recent_alerts(selected_symbols),
-            errors=repo.get_recent_errors(selected_symbols),
+            metrics=repo.get_today_metrics(symbols_now),
+            symbols=repo.get_symbol_states(symbols_now),
+            benchmarks=repo.get_benchmark_states(benchmarks_now),
+            llm_outputs=repo.get_recent_llm_outputs(symbols_now),
+            alerts=repo.get_recent_alerts(symbols_now),
+            errors=repo.get_recent_errors(symbols_now),
+            watchlist=watchlist_payload(),
         )
 
     @app.get("/api/status")
     def api_status() -> dict:
+        symbols_now = selected_symbols()
+        benchmarks_now = selected_benchmarks()
         return {
             "generated_at_utc": utc_now_iso(),
             "status": repo.get_status(),
-            "today_metrics": repo.get_today_metrics(selected_symbols),
-            "symbols": repo.get_symbol_states(selected_symbols),
-            "benchmarks": repo.get_benchmark_states(selected_benchmarks),
-            "recent_llm_outputs": repo.get_recent_llm_outputs(selected_symbols),
-            "recent_alerts": repo.get_recent_alerts(selected_symbols),
-            "recent_errors": repo.get_recent_errors(selected_symbols),
+            "today_metrics": repo.get_today_metrics(symbols_now),
+            "symbols": repo.get_symbol_states(symbols_now),
+            "benchmarks": repo.get_benchmark_states(benchmarks_now),
+            "recent_llm_outputs": repo.get_recent_llm_outputs(symbols_now),
+            "recent_alerts": repo.get_recent_alerts(symbols_now),
+            "recent_errors": repo.get_recent_errors(symbols_now),
+            "watchlist": watchlist_payload(),
         }
 
     @app.get("/api/health")
@@ -60,6 +94,30 @@ def create_app(
             "worker_health": status["worker_health"],
             "market_session": status["market_session"],
             "latest_llm_at": status["latest_llm_at"],
+        }
+
+    @app.get("/api/watchlist")
+    def api_watchlist() -> dict:
+        return {
+            "watchlist": watchlist_payload(),
+            "configurable": db is not None,
+        }
+
+    @app.post("/api/watchlist")
+    def api_add_watch_symbol(payload: dict) -> dict:
+        if db is None:
+            raise HTTPException(status_code=400, detail="watchlist editing is unavailable when dashboard uses mysql mode")
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        if not re.fullmatch(r"[A-Z0-9._-]{1,10}", symbol):
+            raise HTTPException(status_code=422, detail="symbol must be 1-10 chars and only contain A-Z, 0-9, dot, underscore, or hyphen")
+        if not db.list_watch_symbols("primary"):
+            for default_symbol in settings.symbols:
+                db.add_watch_symbol(default_symbol, profile="primary")
+        added_symbol = db.add_watch_symbol(symbol, profile="primary")
+        return {
+            "ok": True,
+            "symbol": added_symbol,
+            "watchlist": watchlist_payload(),
         }
 
     return app
@@ -148,6 +206,7 @@ def render_dashboard(
     llm_outputs: list[dict],
     alerts: list[dict],
     errors: list[dict],
+    watchlist: dict[str, list[str]],
 ) -> str:
     symbol_cards = "\n".join(_render_symbol_card(item) for item in symbols)
     benchmark_cards = "\n".join(_render_benchmark_card(item) for item in benchmarks)
@@ -197,6 +256,8 @@ def render_dashboard(
         f"<li><b>{row['symbol']}</b><span>{row['created_at_utc']} · {_label(row['analysis_level'])}</span><p>{row['error']}</p></li>"
         for row in errors
     ) or "<li class='muted-row'>暂无近期错误</li>"
+    monitored_primary = " · ".join(watchlist.get("primary") or [])
+    monitored_benchmark = " · ".join(watchlist.get("benchmark") or [])
     return f"""
 <!doctype html>
 <html lang="zh-CN">
@@ -204,23 +265,53 @@ def render_dashboard(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@600;700&display=swap" rel="stylesheet">
   <title>美股 AI 盯盘控制台</title>
   <style>
     :root {{
-      --bg: #f3f4ef; --panel: #fffffb; --ink: #17211d; --muted: #66706b;
-      --line: #d9ded7; --green: #0d7756; --red: #b63d32; --amber: #a36a00; --blue: #245c83;
-      --soft: #e9eee9; --dark: #18231f;
+      --bg: #0f141a; --panel: #17202a; --ink: #e8edf4; --muted: #9fb0c4;
+      --line: #273647; --green: #1bc18f; --red: #ef6f7a; --amber: #f5b94c; --blue: #66b7ff;
+      --soft: #1e2b39; --dark: #0a1016;
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 "Avenir Next", "Helvetica Neue", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    header {{ padding: 22px 32px 14px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #fbfcf9, #eef2ed); }}
-    h1 {{ margin: 0; font-size: clamp(22px, 4vw, 34px); letter-spacing: 0; }}
+    body {{ margin: 0; background: radial-gradient(circle at 8% 0%, #1a2633 0, #0f141a 38%), var(--bg); color: var(--ink); font: 14px/1.5 "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif; }}
+    header {{ padding: 22px 32px 14px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #121a24, #0e151d); }}
+    h1 {{ margin: 0; font-size: clamp(22px, 4vw, 34px); letter-spacing: 0; font-family: "Sora", "IBM Plex Sans", sans-serif; }}
     h2 {{ margin: 0 0 12px; font-size: 16px; }}
     .sub {{ color: var(--muted); margin-top: 4px; }}
+    .watch-panel {{ display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }}
+    .watch-meta {{ display: grid; gap: 8px; }}
+    .watch-badges {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .watch-badge {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; color: var(--ink); background: rgba(102,183,255,.08); }}
+    .watch-form {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
+    .watch-input {{
+      width: 180px;
+      height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #0d1722;
+      color: var(--ink);
+      padding: 0 10px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }}
+    .watch-btn {{
+      height: 36px;
+      border: 1px solid rgba(27,193,143,.45);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(27,193,143,.28), rgba(27,193,143,.15));
+      color: #d8ffef;
+      font-weight: 600;
+      padding: 0 14px;
+      cursor: pointer;
+    }}
+    .watch-btn:hover {{ filter: brightness(1.08); }}
     main {{ padding: 24px 32px 40px; display: grid; gap: 18px; }}
     .status {{ display: grid; grid-template-columns: 1.2fr 1fr 1fr 1.4fr; gap: 12px; }}
-    .metric, section, .card, .stat, .cost-panel, .errors {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 1px 0 rgba(20,30,25,.03); }}
-    .metric.primary {{ background: var(--dark); color: #f6f8f4; border-color: var(--dark); }}
+    .metric, section, .card, .stat, .cost-panel, .errors {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 10px 30px rgba(4,9,14,.2); }}
+    .metric.primary {{ background: var(--dark); color: #f6f8f4; border-color: var(--line); }}
     .metric b {{ display: block; font-size: clamp(18px, 3vw, 26px); margin-top: 3px; line-height: 1.15; }}
     .metric span, .stat span {{ color: var(--muted); display: block; font-size: 12px; }}
     .metric.primary span {{ color: #b9c4bd; }}
@@ -228,7 +319,7 @@ def render_dashboard(
     .stats {{ display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; }}
     .stat b {{ display: block; margin-top: 2px; font-size: 24px; }}
     .cost-panel h2 {{ margin-bottom: 10px; }}
-    .bar {{ height: 14px; border: 1px solid var(--line); background: #eef0eb; display: grid; grid-template-columns: {json_pct}fr {image_pct}fr; overflow: hidden; border-radius: 999px; }}
+    .bar {{ height: 14px; border: 1px solid var(--line); background: #101923; display: grid; grid-template-columns: {json_pct}fr {image_pct}fr; overflow: hidden; border-radius: 999px; }}
     .bar i:first-child {{ background: var(--green); }}
     .bar i:last-child {{ background: var(--amber); }}
     .legend {{ display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; margin-top: 8px; }}
@@ -236,10 +327,10 @@ def render_dashboard(
     .benchmark-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
     .mobile-feed {{ display: none; gap: 10px; }}
     .card {{ background:
-        radial-gradient(circle at top right, rgba(36,92,131,.08), transparent 28%),
-        linear-gradient(180deg, #fffef9, #fbfcfa); }}
+        radial-gradient(circle at top right, rgba(102,183,255,.12), transparent 28%),
+        linear-gradient(180deg, #18222e, #141d28); }}
     .benchmark-card {{
-      background: linear-gradient(180deg, #f8faf8, #fbfcfa);
+      background: linear-gradient(180deg, #1a2431, #141d28);
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 14px;
@@ -256,7 +347,7 @@ def render_dashboard(
     .symbol {{ font-size: 24px; font-weight: 700; }}
     .headline {{ display: flex; flex-direction: column; gap: 8px; }}
     .meta-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .pill {{ display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: #f6f8f4; font-size: 12px; color: var(--muted); }}
+    .pill {{ display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.03); font-size: 12px; color: var(--muted); }}
     .pill.bias-bullish {{ background: rgba(13,119,86,.12); color: var(--green); border-color: rgba(13,119,86,.22); }}
     .pill.bias-bearish {{ background: rgba(182,61,50,.10); color: var(--red); border-color: rgba(182,61,50,.22); }}
     .pill.bias-neutral {{ background: rgba(36,92,131,.08); color: var(--blue); border-color: rgba(36,92,131,.2); }}
@@ -267,7 +358,7 @@ def render_dashboard(
     .action-banner {{
       display: flex; align-items: center; justify-content: space-between; gap: 12px;
       padding: 10px 12px; margin: 0 0 12px; border: 1px solid var(--line); border-radius: 8px;
-      background: linear-gradient(180deg, #f8faf7, #f1f5f1);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.01));
     }}
     .action-copy {{ min-width: 0; }}
     .action-copy span {{ display: block; color: var(--muted); font-size: 12px; }}
@@ -275,20 +366,20 @@ def render_dashboard(
     .action-tag {{
       flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
       min-width: 88px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
-      background: #fffef9; font-size: 13px; font-weight: 600;
+      background: rgba(255,255,255,.03); font-size: 13px; font-weight: 600;
     }}
     .action-tag.bullish {{ color: var(--green); border-color: rgba(13,119,86,.25); background: rgba(13,119,86,.08); }}
     .action-tag.bearish {{ color: var(--red); border-color: rgba(182,61,50,.25); background: rgba(182,61,50,.08); }}
     .action-tag.neutral {{ color: var(--blue); border-color: rgba(36,92,131,.25); background: rgba(36,92,131,.08); }}
     .trade-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }}
-    .trade-box {{ padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcf9; min-width: 0; }}
+    .trade-box {{ padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #12202e; min-width: 0; }}
     .trade-box span {{ display: block; color: var(--muted); font-size: 12px; }}
     .trade-box b {{ display: block; margin-top: 3px; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
     .cell {{ border-top: 1px solid var(--line); padding-top: 8px; min-width: 0; }}
     .cell span {{ color: var(--muted); display: block; font-size: 12px; }}
     .events {{ margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap; }}
-    .event {{ padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: #f7faf9; font-size: 12px; }}
+    .event {{ padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.03); font-size: 12px; }}
     .chart {{ margin-top: 12px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ text-align: left; padding: 9px 8px; border-top: 1px solid var(--line); vertical-align: top; }}
@@ -297,7 +388,7 @@ def render_dashboard(
     .feed-card {{
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: #fbfcf9;
+      background: #121b27;
       padding: 12px;
       display: grid;
       gap: 6px;
@@ -314,6 +405,8 @@ def render_dashboard(
     @media (max-width: 980px) {{
       .status, .overview, .split {{ grid-template-columns: 1fr; }}
       .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .watch-panel {{ grid-template-columns: 1fr; }}
+      .watch-form {{ justify-content: flex-start; }}
       header, main {{ padding-left: 16px; padding-right: 16px; }}
       table {{ display: block; overflow-x: auto; white-space: nowrap; }}
     }}
@@ -348,6 +441,20 @@ def render_dashboard(
       <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
     </div>
     <div class="sub">{'配置提醒：本地 .env 含敏感字段 ' + warning_text + '，建议轮换并移入密钥管理。' if warning_text else ''}</div>
+    <section>
+      <h2>监控列表</h2>
+      <div class="watch-panel">
+        <div class="watch-meta">
+          <div class="sub">主监控：{monitored_primary or '-'}</div>
+          <div class="sub">参考监控：{monitored_benchmark or '-'}</div>
+          <div class="watch-badges">{''.join(f"<span class='watch-badge'>{symbol}</span>" for symbol in watchlist.get('primary', [])) or "<span class='watch-badge'>暂无</span>"}</div>
+        </div>
+        <form class="watch-form" id="watch-form">
+          <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
+          <button class="watch-btn" type="submit">加入监控</button>
+        </form>
+      </div>
+    </section>
     <section>
       <h2>主观察</h2>
       <div class="cards">{symbol_cards}</div>
@@ -385,6 +492,33 @@ def render_dashboard(
       <div class="mobile-feed">{alert_mobile_cards}</div>
     </section>
   </main>
+  <script>
+    const watchForm = document.getElementById("watch-form");
+    if (watchForm) {{
+      watchForm.addEventListener("submit", async (event) => {{
+        event.preventDefault();
+        const input = document.getElementById("watch-symbol");
+        const symbol = (input.value || "").trim().toUpperCase();
+        if (!symbol) return;
+        try {{
+          const response = await fetch("/api/watchlist", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ symbol }}),
+          }});
+          if (!response.ok) {{
+            const data = await response.json().catch(() => ({{}}));
+            alert(data.detail || "加入失败，请检查代码格式");
+            return;
+          }}
+          input.value = "";
+          location.reload();
+        }} catch (_) {{
+          alert("网络异常，稍后再试");
+        }}
+      }});
+    }}
+  </script>
 </body>
 </html>
 """
@@ -397,6 +531,16 @@ def _render_symbol_card(item: dict) -> str:
     score_value = item["sentiment_score"]
     score_class = "score negative" if isinstance(score_value, (int, float)) and score_value < 0 else "score"
     entry_label, stop_label, target_label = _trade_labels(item["bias"])
+    actionable_plan = has_actionable_trade_levels(
+        setup_type=item.get("setup_type"),
+        entry_zone=item.get("entry_zone"),
+        stop_loss=item.get("stop_loss"),
+        take_profit=item.get("take_profit"),
+        risk_reward_ratio=item.get("risk_reward_ratio"),
+    )
+    entry_value = _fmt_price_band(item["entry_zone"], item["bias"]) if actionable_plan else "-"
+    stop_value = _fmt(item["stop_loss"]) if actionable_plan else "-"
+    target_value = _fmt_price_band(item["take_profit"], item["bias"]) if actionable_plan else "-"
     action_label = _action_label(item["bias"])
     action_hint = _action_hint(item["bias"])
     return f"""
@@ -423,9 +567,9 @@ def _render_symbol_card(item: dict) -> str:
         <div class="action-tag {bias}">{action_label}</div>
       </div>
       <div class="trade-strip">
-        <div class="trade-box"><span>{entry_label}</span><b>{_fmt_price_band(item['entry_zone'], item['bias'])}</b></div>
-        <div class="trade-box"><span>{stop_label}</span><b>{_fmt(item['stop_loss'])}</b></div>
-        <div class="trade-box"><span>{target_label}</span><b>{_fmt_price_band(item['take_profit'], item['bias'])}</b></div>
+        <div class="trade-box"><span>{entry_label}</span><b>{entry_value}</b></div>
+        <div class="trade-box"><span>{stop_label}</span><b>{stop_value}</b></div>
+        <div class="trade-box"><span>{target_label}</span><b>{target_value}</b></div>
       </div>
       <div class="grid">
         <div class="cell"><span>主交易收盘</span>{_fmt(item['regular_market_price'])}</div>

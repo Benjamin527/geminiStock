@@ -26,11 +26,12 @@ from gemini_stock.notify.channels import (
     TelegramNotifier,
     WeComNotifier,
     format_premarket_brief,
+    send_feishu_interactive_card,
     send_feishu_text,
 )
 from gemini_stock.replay import build_daily_review, format_daily_review
 from gemini_stock.rules.alert_rules import AlertRuleEngine, BenchmarkAlertRuleEngine
-from gemini_stock.rules.price_action_alerts import build_price_action_alerts, format_price_action_alert
+from gemini_stock.rules.price_action_alerts import build_price_action_alerts, build_price_action_card, format_price_action_alert
 from gemini_stock.schedule import MarketSession, get_schedule_decision
 from gemini_stock.storage.db import Database
 from gemini_stock.storage.mysql_sync import MySQLSync, MySQLSyncConfig
@@ -219,11 +220,13 @@ def run_symbol(
 def run_once(settings: Settings) -> None:
     db = Database(settings.database_path)
     db.initialize()
+    primary_symbols = db.list_watch_symbols("primary") or settings.symbols
+    benchmark_symbols = db.list_watch_symbols("benchmark") or settings.benchmark_symbols
     context = RuntimeContext.from_settings(settings)
     primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
     benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
     benchmark_results: list[SymbolRunResult] = []
-    for symbol in settings.symbols:
+    for symbol in primary_symbols:
         try:
             run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context)
         except MarketDataError as exc:
@@ -231,7 +234,7 @@ def run_once(settings: Settings) -> None:
             logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
         except Exception as exc:
             logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
-    for symbol in settings.benchmark_symbols:
+    for symbol in benchmark_symbols:
         try:
             result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context)
             if result is not None:
@@ -242,7 +245,7 @@ def run_once(settings: Settings) -> None:
         except Exception as exc:
             logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
     maybe_send_premarket_brief(settings, db, benchmark_results)
-    run_maintenance_tasks(settings, db=db)
+    run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
     maybe_sync_remote_mysql(settings, db)
 
 
@@ -250,11 +253,12 @@ def run_maintenance_tasks(
     settings: Settings,
     db: Database | None = None,
     now: datetime | None = None,
+    review_symbols: list[str] | None = None,
 ) -> None:
     database = db or Database(settings.database_path)
     if db is None:
         database.initialize()
-    maybe_send_daily_review(settings, database, now=now)
+    maybe_send_daily_review(settings, database, review_symbols=review_symbols or settings.symbols, now=now)
 
 
 def maybe_send_premarket_brief(
@@ -304,6 +308,7 @@ def maybe_send_premarket_brief(
 def maybe_send_daily_review(
     settings: Settings,
     db: Database,
+    review_symbols: list[str],
     now: datetime | None = None,
 ) -> None:
     current = (now or datetime.now(BEIJING)).astimezone(BEIJING)
@@ -313,9 +318,7 @@ def maybe_send_daily_review(
     event_key = f"daily_review:{trading_date.isoformat()}"
     if db.has_alert_event("feishu", event_key):
         return
-    review = build_daily_review(db, settings.symbols, trading_date)
-    if review.evaluated_count == 0:
-        return
+    review = build_daily_review(db, review_symbols, trading_date)
     text = format_daily_review(review)
     try:
         sent = send_feishu_text(settings.feishu_webhook_url, text, bypass_quiet_hours=True)
@@ -328,7 +331,7 @@ def maybe_send_daily_review(
             {
                 "event_key": event_key,
                 "type": "daily_review",
-                "symbols": settings.symbols,
+                "symbols": review_symbols,
                 "trading_date": trading_date.isoformat(),
                 "accuracy_pct": review.accuracy_pct,
                 "text": text,
@@ -362,7 +365,19 @@ def maybe_send_price_action_alerts(
             average_cost=settings.average_costs.get(symbol),
         )
         try:
-            sent = send_feishu_text(settings.feishu_webhook_url, text)
+            if alert.action == "buy":
+                card = build_price_action_card(
+                    alert,
+                    position_qty=settings.positions.get(symbol),
+                    average_cost=settings.average_costs.get(symbol),
+                )
+                sent = send_feishu_interactive_card(
+                    settings.feishu_webhook_url,
+                    card,
+                    bypass_quiet_hours=(alert.level == "P1"),
+                )
+            else:
+                sent = send_feishu_text(settings.feishu_webhook_url, text)
         except Exception as exc:
             logger.error("price_action_alert_failed", extra={"symbol": symbol, "event_key": alert.event_key, "error": str(exc)})
             continue
@@ -371,9 +386,16 @@ def maybe_send_price_action_alerts(
                 symbol,
                 {
                     "event_key": alert.event_key,
-                    "type": "price_action",
+                    "type": (
+                        "price_action_p1"
+                        if alert.action == "buy" and alert.level == "P1"
+                        else "price_action_p2"
+                        if alert.action == "buy"
+                        else "price_action"
+                    ),
                     "symbol": alert.symbol,
                     "action": alert.action,
+                    "level": alert.level,
                     "latest_price": alert.latest_price,
                     "reference_label": alert.reference_label,
                     "reference_zone": alert.reference_zone,

@@ -7,13 +7,22 @@ def _utc(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetim
     return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
 
-def test_regular_market_runs_every_twenty_minutes():
-    # 2026-01-05 15:00 UTC = 10:00 New York
+def test_regular_market_opening_two_hours_run_every_five_minutes():
+    # 2026-01-05 15:00 UTC = 10:00 New York (opening window)
     decision = get_schedule_decision(_utc(2026, 1, 5, 15, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
-    assert decision.interval_seconds == 20 * 60
+    assert decision.interval_seconds == 5 * 60
+
+
+def test_regular_market_after_opening_window_runs_every_thirty_minutes():
+    # 2026-01-05 17:00 UTC = 12:00 New York
+    decision = get_schedule_decision(_utc(2026, 1, 5, 17, 0))
+
+    assert decision.should_run is True
+    assert decision.session == MarketSession.REGULAR
+    assert decision.interval_seconds == 30 * 60
 
 
 def test_premarket_runs_every_thirty_minutes():

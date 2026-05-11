@@ -44,13 +44,14 @@ def _candles(price: float) -> pd.DataFrame:
 
 
 def test_maybe_send_price_action_alerts_sends_and_deduplicates_feishu(tmp_path, monkeypatch):
-    sent_texts = []
+    sent_cards = []
 
-    def fake_send_feishu_text(webhook_url, text):
-        sent_texts.append(text)
+    def fake_send_feishu_card(webhook_url, card, **kwargs):
+        sent_cards.append(card)
         return True
 
-    monkeypatch.setattr("gemini_stock.main.send_feishu_text", fake_send_feishu_text)
+    monkeypatch.setattr("gemini_stock.main.send_feishu_interactive_card", fake_send_feishu_card)
+    monkeypatch.setattr("gemini_stock.main.send_feishu_text", lambda webhook_url, text, **kwargs: True)
     settings = Settings(feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token")
     db = Database(tmp_path / "signals.db")
     db.initialize()
@@ -60,14 +61,14 @@ def test_maybe_send_price_action_alerts_sends_and_deduplicates_feishu(tmp_path, 
 
     assert first == 1
     assert second == 0
-    assert len(sent_texts) == 1
-    assert "【价格到位】TSLL｜买入区" in sent_texts[0]
-    assert db.has_alert_event("feishu", "price_action:TSLL:buy:2026-01-05:12.10-12.20") is True
+    assert len(sent_cards) == 1
+    assert "P2 一般买入" in sent_cards[0]["header"]["title"]["content"]
+    assert db.has_alert_event("feishu", "price_action_p2:TSLL:buy:2026-01-05:12.10-12.20") is True
 
 
 def test_maybe_send_price_action_alerts_skips_benchmarks(tmp_path, monkeypatch):
     sent_texts = []
-    monkeypatch.setattr("gemini_stock.main.send_feishu_text", lambda webhook_url, text: sent_texts.append(text) or True)
+    monkeypatch.setattr("gemini_stock.main.send_feishu_text", lambda webhook_url, text, **kwargs: sent_texts.append(text) or True)
     settings = Settings(feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token")
     db = Database(tmp_path / "signals.db")
     db.initialize()
@@ -76,3 +77,25 @@ def test_maybe_send_price_action_alerts_skips_benchmarks(tmp_path, monkeypatch):
 
     assert count == 0
     assert sent_texts == []
+
+
+def test_maybe_send_price_action_alerts_uses_bypass_for_high_priority(tmp_path, monkeypatch):
+    captured = {"bypass": None, "title": None}
+
+    def fake_send_feishu_card(webhook_url, card, **kwargs):
+        captured["bypass"] = kwargs.get("bypass_quiet_hours")
+        captured["title"] = card["header"]["title"]["content"]
+        return True
+
+    monkeypatch.setattr("gemini_stock.main.send_feishu_interactive_card", fake_send_feishu_card)
+    monkeypatch.setattr("gemini_stock.main.send_feishu_text", lambda webhook_url, text, **kwargs: True)
+    settings = Settings(feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token")
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+    signal = _signal().model_copy(update={"sentiment_score": 8.0, "confidence": 0.76, "risk_reward_ratio": 2.0})
+
+    count = maybe_send_price_action_alerts(settings, db, "TSLL", signal, _candles(12.15), trading_date="2026-01-05")
+
+    assert count == 1
+    assert captured["bypass"] is True
+    assert "P1 特别推荐买入" in captured["title"]

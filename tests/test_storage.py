@@ -128,3 +128,15 @@ def test_database_migrates_existing_alert_payload_metadata(tmp_path):
 
     assert row["event_key"] == "price_action:old"
     assert row["alert_type"] == "price_action"
+
+
+def test_database_watchlist_can_append_and_list_symbols(tmp_path):
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+
+    db.add_watch_symbol("conl", profile="primary")
+    db.add_watch_symbol("TSLL", profile="primary")
+    db.add_watch_symbol("QQQ", profile="benchmark")
+
+    assert db.list_watch_symbols("primary") == ["CONL", "TSLL"]
+    assert db.list_watch_symbols("benchmark") == ["QQQ"]

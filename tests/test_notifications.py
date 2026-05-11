@@ -1,7 +1,12 @@
 from datetime import datetime, timezone
 
 from gemini_stock.benchmarks import BenchmarkForecast
-from gemini_stock.notify.channels import FeishuNotifier, format_alert, format_premarket_brief
+from gemini_stock.notify.channels import (
+    FeishuNotifier,
+    format_alert,
+    format_premarket_brief,
+    send_feishu_interactive_card,
+)
 from gemini_stock.schemas import AlertDecision, GeminiSignal, TechnicalSnapshot
 
 
@@ -120,6 +125,33 @@ def test_feishu_notifier_posts_text_payload(monkeypatch):
     assert captured["url"].endswith("/token")
     assert captured["json"]["msg_type"] == "text"
     assert "SPY" in captured["json"]["content"]["text"]
+    assert captured["timeout"] == 10
+
+
+def test_send_feishu_interactive_card_posts_card_payload(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("gemini_stock.notify.channels.requests.post", fake_post)
+
+    ok = send_feishu_interactive_card(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/token",
+        {"header": {"title": {"content": "x"}}},
+        now_fn=lambda: datetime(2026, 1, 5, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert ok is True
+    assert captured["json"]["msg_type"] == "interactive"
+    assert "card" in captured["json"]
     assert captured["timeout"] == 10
 
 

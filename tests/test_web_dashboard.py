@@ -180,6 +180,33 @@ def test_dashboard_page_uses_long_only_labels_for_bearish_setups(tmp_path, monke
     assert "11.96 - 12.09" in response.text
 
 
+def test_dashboard_hides_non_actionable_trade_ranges(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot())
+    db.save_llm_output(
+        "SPY",
+        {"analysis_level": "json_only", "has_image": False},
+        _signal().model_copy(
+            update={
+                "setup_type": "no_trade",
+                "entry_zone": [15.56, 15.58],
+                "stop_loss": 15.55,
+                "take_profit": [15.59, 15.61],
+                "risk_reward_ratio": 0.4,
+            }
+        ).json_dict(),
+        None,
+    )
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+
+    response = TestClient(app).get("/")
+
+    assert "15.56 - 15.58" not in response.text
+    assert "15.59 - 15.61" not in response.text
+
+
 def test_dashboard_repository_returns_today_metrics(tmp_path):
     db = Database(tmp_path / "dashboard.db")
     db.initialize()
@@ -295,6 +322,20 @@ def test_dashboard_renders_benchmark_overview_section(tmp_path, monkeypatch):
     assert "走弱触发" in response.text
     assert "走强触发" in response.text
     assert payload["benchmarks"][0]["symbol"] == "SPY"
+
+
+def test_dashboard_api_can_add_watchlist_symbol(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    app = create_app(database_path=db.path, chart_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.post("/api/watchlist", json={"symbol": "nvda"})
+    watchlist = client.get("/api/watchlist").json()["watchlist"]["primary"]
+
+    assert response.status_code == 200
+    assert "NVDA" in watchlist
 
 
 def test_to_beijing_time_handles_sqlite_utc_suffix():

@@ -21,9 +21,16 @@ class SymbolReview:
     entry_zone: list[float]
     stop_loss: float
     take_profit: list[float]
+    entered: bool
+    stopped: bool
+    target_hit: bool
     outcome: str
     score: float
     lesson: str
+    decision_level: str
+    invalidation: str
+    no_chase_zone: str
+    position_constraint: str
 
 
 @dataclass(frozen=True)
@@ -151,10 +158,14 @@ def format_daily_review(review: DailyReview) -> str:
         for item in review.symbol_reviews:
             outcome_label = {"hit": "命中", "miss": "偏差", "neutral": "观望"}.get(item.outcome, item.outcome)
             lines.append(
-                f"{item.symbol}｜{outcome_label}｜{item.first_price:.2f}->{item.last_price:.2f}｜高低 {item.high:.2f}/{item.low:.2f}"
+                f"{item.symbol}｜{outcome_label}｜{item.decision_level}｜{item.first_price:.2f}->{item.last_price:.2f}｜高低 {item.high:.2f}/{item.low:.2f}"
+            )
+            lines.append(
+                f"  失效条件：{_shorten(item.invalidation, 48)}｜不追价区：{_shorten(item.no_chase_zone, 42)}｜仓位：{_shorten(item.position_constraint, 32)}"
             )
     else:
         lines.append("无足够样本评分。")
+        lines.append("结论：观察｜先记录 L1，等待二次握手，不为交易而交易。")
     if review.learning_notes:
         lines.append(f"学习：{_shorten(review.learning_notes[0], 34)}")
     return "\n".join(lines)
@@ -190,6 +201,10 @@ def _review_symbol(signal: GeminiSignal, candles: list[Candle]) -> SymbolReview:
 
     outcome = _classify_outcome(signal, entered, stopped, target_hit)
     lesson = _symbol_lesson(signal, entered, stopped, target_hit, first.close, last.close)
+    decision_level = _decision_level(signal, entered, stopped, target_hit, outcome)
+    invalidation = _invalidation_condition(signal, entry_low, entry_high)
+    no_chase_zone = _no_chase_zone(signal, entry_low, entry_high)
+    position_constraint = _position_constraint(signal, outcome)
     score = 1.0 if outcome == "hit" else 0.5 if outcome == "neutral" else 0.0
     return SymbolReview(
         symbol=signal.symbol,
@@ -202,9 +217,16 @@ def _review_symbol(signal: GeminiSignal, candles: list[Candle]) -> SymbolReview:
         entry_zone=[entry_low, entry_high],
         stop_loss=signal.stop_loss,
         take_profit=[target_low, target_high],
+        entered=entered,
+        stopped=stopped,
+        target_hit=target_hit,
         outcome=outcome,
         score=score,
         lesson=lesson,
+        decision_level=decision_level,
+        invalidation=invalidation,
+        no_chase_zone=no_chase_zone,
+        position_constraint=position_constraint,
     )
 
 
@@ -250,7 +272,44 @@ def _build_learning_notes(reviews: list[SymbolReview]) -> list[str]:
     neutral = [review for review in reviews if review.outcome == "neutral"]
     if neutral:
         notes.append("未触发参考区的信号不强行评分为失败，继续等待回踩或尾盘确认，避免为了交易而交易。")
+    notes.append("次日盘中先看结论分级，再看价位区间与条件，最后才看仓位，避免情绪先行。")
     return notes
+
+
+def _decision_level(signal: GeminiSignal, entered: bool, stopped: bool, target_hit: bool, outcome: str) -> str:
+    if stopped or outcome == "miss":
+        return "失效"
+    if signal.setup_type == "no_trade" or signal.bias == "neutral":
+        return "观察"
+    if not entered:
+        return "等二次握手"
+    if target_hit:
+        return "确认后小仓"
+    return "试探"
+
+
+def _invalidation_condition(signal: GeminiSignal, entry_low: float, entry_high: float) -> str:
+    if signal.setup_type == "no_trade" or signal.bias == "neutral":
+        return f"未出现二次握手前，不开新仓；若跌破 {entry_low:.2f} 附近弱支撑继续观望。"
+    if signal.bias == "bearish":
+        return f"有效站上风险位 {signal.stop_loss:.2f} 且未回落，视为失效。"
+    return f"有效跌破止损位 {signal.stop_loss:.2f} 且未收回，视为失效。"
+
+
+def _no_chase_zone(signal: GeminiSignal, entry_low: float, entry_high: float) -> str:
+    if signal.bias == "bearish":
+        return f"跌离卖出参考 {entry_low:.2f}-{entry_high:.2f} 后不追空，等反抽结构。"
+    return f"高于买入参考上沿 {entry_high:.2f} 后快速拉升，不追价。"
+
+
+def _position_constraint(signal: GeminiSignal, outcome: str) -> str:
+    if signal.setup_type == "no_trade" or signal.bias == "neutral":
+        return "0-0.5 成观察仓，仅做记录。"
+    if outcome == "miss":
+        return "下一轮降至轻仓试探，等待二次握手再加。"
+    if signal.bias == "bearish":
+        return "先减仓后观察，避免重仓单向押注。"
+    return "先轻仓试探，确认后分批，不让单标的过重。"
 
 
 def _zone(values: list[float]) -> tuple[float, float]:

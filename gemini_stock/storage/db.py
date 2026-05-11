@@ -79,6 +79,15 @@ class Database:
                     payload_json TEXT NOT NULL,
                     created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 );
+
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    UNIQUE(symbol, profile)
+                );
                 """
             )
             self._ensure_column(conn, "llm_outputs", "analysis_level", "TEXT")
@@ -100,6 +109,8 @@ class Database:
                     ON alerts(channel, event_key);
                 CREATE INDEX IF NOT EXISTS idx_alerts_symbol_channel_type_created
                     ON alerts(symbol, channel, alert_type, created_at_utc DESC);
+                CREATE INDEX IF NOT EXISTS idx_watchlist_profile_enabled
+                    ON watchlist(profile, enabled, created_at_utc DESC);
                 """
             )
             self._backfill_llm_metadata(conn)
@@ -376,11 +387,39 @@ class Database:
         return candles
 
     def count(self, table: str) -> int:
-        allowed = {"raw_candles", "features", "news", "llm_outputs", "alerts"}
+        allowed = {"raw_candles", "features", "news", "llm_outputs", "alerts", "watchlist"}
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def list_watch_symbols(self, profile: str = "primary") -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol
+                FROM watchlist
+                WHERE profile = ? AND enabled = 1
+                ORDER BY created_at_utc ASC, symbol ASC
+                """,
+                (profile,),
+            ).fetchall()
+        return [str(row["symbol"]).upper() for row in rows]
+
+    def add_watch_symbol(self, symbol: str, profile: str = "primary") -> str:
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            raise ValueError("symbol is required")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watchlist (symbol, profile, enabled)
+                VALUES (?, ?, 1)
+                ON CONFLICT(symbol, profile) DO UPDATE SET enabled = 1
+                """,
+                (normalized, profile),
+            )
+        return normalized
 
 
 def _parse_datetime(value: str) -> datetime | None:
@@ -418,3 +457,7 @@ def _extract_llm_metadata(input_json: str) -> tuple[str | None, str | None, int]
         _extract_snapshot_timestamp(input_payload),
         1 if input_payload.get("has_image") else 0,
     )
+
+
+def _normalize_symbol(value: str) -> str:
+    return "".join(ch for ch in value.upper().strip() if ch.isalnum() or ch in {".", "-", "_"})

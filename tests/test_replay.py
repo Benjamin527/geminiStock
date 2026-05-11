@@ -149,4 +149,5 @@ def test_format_daily_review_includes_score_and_learning_notes():
     assert "【每日复盘】2026-01-05" in text
     assert "准确率：100.0%" in text
     assert "学习：" in text
-    assert len(text.splitlines()) <= 6
+    assert "结论：观察｜先记录 L1，等待二次握手，不为交易而交易。" in text
+    assert len(text.splitlines()) <= 8

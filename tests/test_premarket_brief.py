@@ -121,8 +121,8 @@ def test_maybe_send_daily_review_sends_once_at_beijing_eight(monkeypatch, tmp_pa
     monkeypatch.setattr("gemini_stock.main.send_feishu_text", fake_send)
     now = datetime.fromisoformat("2026-01-06T08:05:00+08:00")
 
-    maybe_send_daily_review(settings, db, now=now)
-    maybe_send_daily_review(settings, db, now=now)
+    maybe_send_daily_review(settings, db, review_symbols=settings.symbols, now=now)
+    maybe_send_daily_review(settings, db, review_symbols=settings.symbols, now=now)
 
     assert captured["calls"] == 1
     assert "【每日复盘】2026-01-05" in captured["text"]
@@ -163,4 +163,28 @@ def test_run_maintenance_tasks_can_send_daily_review_when_market_is_closed(monke
     run_maintenance_tasks(settings, now=datetime.fromisoformat("2026-01-06T08:05:00+08:00"))
 
     assert calls["count"] == 1
+    assert db.has_alert_event("feishu", "daily_review:2026-01-05") is True
+
+
+def test_maybe_send_daily_review_still_sends_when_no_samples(monkeypatch, tmp_path):
+    db = Database(tmp_path / "review.db")
+    db.initialize()
+    settings = Settings(
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token",
+        symbols=["CONL", "TSLL"],
+    )
+    captured = {"calls": 0, "text": ""}
+
+    def fake_send(webhook_url, text, now_fn=None, bypass_quiet_hours=False):
+        captured["calls"] += 1
+        captured["text"] = text
+        return True
+
+    monkeypatch.setattr("gemini_stock.main.send_feishu_text", fake_send)
+    now = datetime.fromisoformat("2026-01-06T08:05:00+08:00")
+
+    maybe_send_daily_review(settings, db, review_symbols=settings.symbols, now=now)
+
+    assert captured["calls"] == 1
+    assert "无足够样本评分。" in captured["text"]
     assert db.has_alert_event("feishu", "daily_review:2026-01-05") is True

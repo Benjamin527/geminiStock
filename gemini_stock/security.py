@@ -18,8 +18,9 @@ SECRET_KEYS = {
 def find_secret_config_warnings(env_path: str | Path = ".env") -> list[str]:
     path = Path(env_path)
     warnings: list[str] = []
+    include_runtime = not path.name.endswith(".example")
     if not path.exists():
-        return _runtime_secret_warnings()
+        return _runtime_secret_warnings() if include_runtime else []
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -29,7 +30,8 @@ def find_secret_config_warnings(env_path: str | Path = ".env") -> list[str]:
         value = value.strip().strip('"').strip("'")
         if key in SECRET_KEYS and _looks_sensitive(value):
             warnings.append(key)
-    warnings.extend(_runtime_secret_warnings())
+    if include_runtime:
+        warnings.extend(_runtime_secret_warnings())
     return sorted(set(warnings))
 
 

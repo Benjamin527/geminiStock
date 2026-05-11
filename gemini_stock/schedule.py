@@ -40,13 +40,14 @@ def classify_market_session(now: datetime | None = None) -> MarketSession:
 
 
 def get_schedule_decision(now: datetime | None = None) -> ScheduleDecision:
+    current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
     session = classify_market_session(now)
     if session == MarketSession.OVERNIGHT:
         return ScheduleDecision(False, session, seconds_until_next_session(now))
     if session == MarketSession.PREMARKET:
         return ScheduleDecision(True, session, 30 * 60)
     if session == MarketSession.REGULAR:
-        return ScheduleDecision(True, session, 20 * 60)
+        return ScheduleDecision(True, session, _regular_interval_seconds(current))
     if session == MarketSession.AFTERHOURS:
         return ScheduleDecision(True, session, 60 * 60)
     return ScheduleDecision(False, session, seconds_until_next_session(now))
@@ -90,3 +91,11 @@ def _next_overnight_start(current: datetime) -> datetime:
     while candidate.weekday() not in {6, 0, 1, 2, 3}:
         candidate = candidate + timedelta(days=1)
     return candidate
+
+
+def _regular_interval_seconds(current: datetime) -> int:
+    regular_open = current.replace(hour=9, minute=30, second=0, microsecond=0)
+    first_two_hours_end = regular_open + timedelta(hours=2)
+    if regular_open <= current < first_two_hours_end:
+        return 5 * 60
+    return 30 * 60
