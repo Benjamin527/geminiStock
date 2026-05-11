@@ -375,6 +375,14 @@ def render_dashboard(
     .trade-box {{ padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #12202e; min-width: 0; }}
     .trade-box span {{ display: block; color: var(--muted); font-size: 12px; }}
     .trade-box b {{ display: block; margin-top: 3px; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }}
+    .trade-box.muted {{ background: #111923; border-color: rgba(159,176,196,.25); }}
+    .trade-box.muted b {{ color: var(--muted); }}
+    .plan-note {{
+      margin: -4px 0 12px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
     .cell {{ border-top: 1px solid var(--line); padding-top: 8px; min-width: 0; }}
     .cell span {{ color: var(--muted); display: block; font-size: 12px; }}
@@ -538,9 +546,11 @@ def _render_symbol_card(item: dict) -> str:
         take_profit=item.get("take_profit"),
         risk_reward_ratio=item.get("risk_reward_ratio"),
     )
-    entry_value = _fmt_price_band(item["entry_zone"], item["bias"]) if actionable_plan else "-"
-    stop_value = _fmt(item["stop_loss"]) if actionable_plan else "-"
-    target_value = _fmt_price_band(item["take_profit"], item["bias"]) if actionable_plan else "-"
+    entry_value = _fmt_price_band(item["entry_zone"], item["bias"])
+    stop_value = _fmt(item["stop_loss"])
+    target_value = _fmt_price_band(item["take_profit"], item["bias"])
+    trade_box_class = "trade-box" if actionable_plan else "trade-box muted"
+    plan_note = "" if actionable_plan else "<div class='plan-note'>当前不可执行，仅观察</div>"
     action_label = _action_label(item["bias"])
     action_hint = _action_hint(item["bias"])
     return f"""
@@ -567,10 +577,11 @@ def _render_symbol_card(item: dict) -> str:
         <div class="action-tag {bias}">{action_label}</div>
       </div>
       <div class="trade-strip">
-        <div class="trade-box"><span>{entry_label}</span><b>{entry_value}</b></div>
-        <div class="trade-box"><span>{stop_label}</span><b>{stop_value}</b></div>
-        <div class="trade-box"><span>{target_label}</span><b>{target_value}</b></div>
+        <div class="{trade_box_class}"><span>{entry_label}</span><b>{entry_value}</b></div>
+        <div class="{trade_box_class}"><span>{stop_label}</span><b>{stop_value}</b></div>
+        <div class="{trade_box_class}"><span>{target_label}</span><b>{target_value}</b></div>
       </div>
+      {plan_note}
       <div class="grid">
         <div class="cell"><span>主交易收盘</span>{_fmt(item['regular_market_price'])}</div>
         <div class="cell"><span>盘后价</span>{_fmt(item['post_market_price'])}</div>

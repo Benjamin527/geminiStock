@@ -180,7 +180,7 @@ def test_dashboard_page_uses_long_only_labels_for_bearish_setups(tmp_path, monke
     assert "11.96 - 12.09" in response.text
 
 
-def test_dashboard_hides_non_actionable_trade_ranges(tmp_path, monkeypatch):
+def test_dashboard_shows_non_actionable_trade_ranges_as_observe_only(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
     db = Database(tmp_path / "dashboard.db")
     db.initialize()
@@ -203,8 +203,10 @@ def test_dashboard_hides_non_actionable_trade_ranges(tmp_path, monkeypatch):
 
     response = TestClient(app).get("/")
 
-    assert "15.56 - 15.58" not in response.text
-    assert "15.59 - 15.61" not in response.text
+    assert "15.56 - 15.58" in response.text
+    assert "15.55" in response.text
+    assert "15.59 - 15.61" in response.text
+    assert "当前不可执行，仅观察" in response.text
 
 
 def test_dashboard_repository_returns_today_metrics(tmp_path):
