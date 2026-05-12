@@ -202,6 +202,14 @@ class DashboardRepository:
             )
         return states
 
+    def build_priority_views(self, symbols: list[str], benchmarks: list[str]) -> dict[str, list[dict[str, Any]]]:
+        symbol_states = self.get_symbol_states(symbols)
+        return {
+            "most_urgent": _rank_most_urgent(symbol_states)[:3],
+            "most_abnormal": _rank_most_abnormal(symbol_states)[:3],
+            "most_actionable": _rank_most_actionable(symbol_states)[:3],
+        }
+
     def get_recent_llm_outputs(self, symbols: list[str], limit: int = 20) -> list[dict[str, Any]]:
         if not self.database_path.exists():
             return []
@@ -264,6 +272,8 @@ class DashboardRepository:
                 sentiment_score = f"{sign}{float(drop_pct):.2f}%" if drop_pct is not None else None
                 bias = f"{payload.get('tier')}档" if payload.get("tier") is not None else None
                 setup_type = event_type or "movement_alert"
+                if payload.get("level_context"):
+                    setup_type = f"{setup_type}:{payload.get('level_context')}"
                 confidence = payload.get("repeat_count")
             else:
                 sentiment_score = signal.get("sentiment_score")
@@ -508,6 +518,141 @@ def _alert_category(alert_type: str | None, setup_type: str | None) -> str:
     if alert_type == "primary_alert":
         return "AI 盯盘"
     return "系统记录"
+
+
+def _rank_most_urgent(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((_priority_card(state, _urgency_score(state)) for state in states), key=lambda item: item["score"], reverse=True)
+
+
+def _rank_most_abnormal(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((_priority_card(state, _abnormal_score(state)) for state in states), key=lambda item: item["score"], reverse=True)
+
+
+def _rank_most_actionable(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted((_priority_card(state, _actionable_score(state)) for state in states), key=lambda item: item["score"], reverse=True)
+
+
+def _priority_card(state: dict[str, Any], score: float) -> dict[str, Any]:
+    distance_score, distance_label = _position_distance_score(state)
+    return {
+        "symbol": state["symbol"],
+        "score": round(score, 2),
+        "bias": state.get("bias"),
+        "setup_type": state.get("setup_type"),
+        "should_alert": state.get("should_alert"),
+        "freshness": (state.get("data_freshness") or {}).get("state"),
+        "distance_score": round(distance_score, 2),
+        "distance_label": distance_label,
+        "explanation": _priority_explanation(state, distance_label),
+    }
+
+
+def _urgency_score(state: dict[str, Any]) -> float:
+    score = float(state.get("sentiment_score") or 0)
+    confidence = float(state.get("confidence") or 0)
+    distance_score, _ = _position_distance_score(state)
+    if state.get("should_alert"):
+        score += 20
+    freshness = (state.get("data_freshness") or {}).get("state")
+    if freshness == "fresh":
+        score += 5
+    elif freshness == "delayed":
+        score += 2
+    return score + confidence * 10 + distance_score
+
+
+def _abnormal_score(state: dict[str, Any]) -> float:
+    score = abs(float(state.get("sentiment_score") or 0))
+    if state.get("analysis_level") == "multimodal_review":
+        score += 3
+    if state.get("has_image"):
+        score += 2
+    return score
+
+
+def _actionable_score(state: dict[str, Any]) -> float:
+    score = float(state.get("confidence") or 0) * 10
+    distance_score, _ = _position_distance_score(state)
+    if state.get("should_alert"):
+        score += 10
+    if state.get("setup_type") and state.get("setup_type") != "no_trade":
+        score += 3
+    freshness = (state.get("data_freshness") or {}).get("state")
+    if freshness == "fresh":
+        score += 3
+    return score + distance_score
+
+
+def _position_distance_score(state: dict[str, Any]) -> tuple[float, str]:
+    price = _to_float(state.get("regular_market_price") or state.get("last_price"))
+    entry_zone = state.get("entry_zone") or []
+    take_profit = state.get("take_profit") or []
+    if price is None:
+        return 0.0, "位置距离 -"
+    for label, zone in (("接近买入区", entry_zone), ("接近目标区", take_profit)):
+        zone_score = _zone_score(price, zone)
+        if zone_score is not None:
+            return zone_score, label
+    return 0.0, "位置距离 远"
+
+
+def _zone_score(price: float, zone: Any) -> float | None:
+    if not isinstance(zone, list) or len(zone) < 2:
+        return None
+    try:
+        low, high = sorted(float(value) for value in zone[:2])
+    except (TypeError, ValueError):
+        return None
+    if low <= price <= high:
+        return 12.0
+    midpoint = (low + high) / 2
+    if midpoint <= 0:
+        return 0.0
+    distance_pct = abs(price - midpoint) / midpoint
+    if distance_pct <= 0.003:
+        return 9.0
+    if distance_pct <= 0.008:
+        return 6.0
+    if distance_pct <= 0.015:
+        return 3.0
+    return 0.0
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _priority_explanation(state: dict[str, Any], distance_label: str) -> str:
+    reasons: list[str] = []
+    if state.get("should_alert"):
+        reasons.append("AI 已触发提醒")
+
+    sentiment = _to_float(state.get("sentiment_score"))
+    if sentiment is not None and abs(sentiment) >= 6:
+        reasons.append("分数波动大")
+
+    confidence = _to_float(state.get("confidence"))
+    if confidence is not None and confidence >= 0.75:
+        reasons.append("置信度高")
+
+    if state.get("has_image") or state.get("analysis_level") == "multimodal_review":
+        reasons.append("刚完成图像复核")
+
+    if distance_label == "接近买入区":
+        reasons.append("价格接近买入区")
+    elif distance_label == "接近目标区":
+        reasons.append("离目标区很近")
+
+    freshness = (state.get("data_freshness") or {}).get("state")
+    if freshness == "fresh":
+        reasons.append("数据刚更新")
+
+    if not reasons:
+        reasons.append("当前关注度相对更高")
+    return "，且".join(reasons[:3]) if len(reasons) > 1 else reasons[0]
 
 
 def _expected_move(bias: str | None, close: float | None, support: float | None, resistance: float | None) -> str:

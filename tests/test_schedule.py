@@ -17,21 +17,30 @@ def test_regular_market_first_ninety_minutes_run_every_minute():
 
 
 def test_regular_market_at_ninety_minute_boundary_runs_every_thirty_minutes():
-    # 2026-01-05 16:00 UTC = 11:00 New York (90 minutes after open)
+    # 2026-01-05 16:00 UTC = 11:00 New York
     decision = get_schedule_decision(_utc(2026, 1, 5, 16, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
-    assert decision.interval_seconds == 30 * 60
+    assert decision.interval_seconds == 5 * 60
 
 
-def test_regular_market_after_opening_window_runs_every_thirty_minutes():
+def test_regular_market_midday_runs_every_ten_minutes():
     # 2026-01-05 17:00 UTC = 12:00 New York
     decision = get_schedule_decision(_utc(2026, 1, 5, 17, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
-    assert decision.interval_seconds == 30 * 60
+    assert decision.interval_seconds == 10 * 60
+
+
+def test_regular_market_near_close_runs_every_two_minutes():
+    # 2026-01-05 20:00 UTC = 15:00 New York
+    decision = get_schedule_decision(_utc(2026, 1, 5, 20, 0))
+
+    assert decision.should_run is True
+    assert decision.session == MarketSession.REGULAR
+    assert decision.interval_seconds == 2 * 60
 
 
 def test_premarket_runs_every_five_minutes():

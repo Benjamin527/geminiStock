@@ -37,6 +37,7 @@ def _technical(symbol: str = "TSLL", close: float = 12.18) -> TechnicalSnapshot:
 def _candles() -> pd.DataFrame:
     prices = [12.42, 12.38, 12.34, 12.31, 12.28, 12.24, 12.21, 12.19, 12.18, 12.18]
     start = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    volumes = [400, 420, 450, 460, 500, 520, 2500, 2600, 2700, 2800]
     return pd.DataFrame(
         [
             {
@@ -45,7 +46,7 @@ def _candles() -> pd.DataFrame:
                 "high": price + 0.03,
                 "low": price - 0.03,
                 "close": price,
-                "volume": 1000,
+                "volume": volumes[idx],
             }
             for idx, price in enumerate(prices)
         ]

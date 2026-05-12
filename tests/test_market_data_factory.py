@@ -20,3 +20,9 @@ def test_market_data_factory_auto_falls_back_to_yfinance_without_polygon_key():
     provider = create_market_data_provider(Settings(data_provider="auto", polygon_api_key=None))
 
     assert isinstance(provider, YFinanceMarketDataProvider)
+
+
+def test_market_data_factory_auto_prefers_polygon_when_key_is_configured():
+    provider = create_market_data_provider(Settings(data_provider="auto", polygon_api_key="test-key"))
+
+    assert isinstance(provider, PolygonMarketDataProvider)

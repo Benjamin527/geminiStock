@@ -546,6 +546,21 @@ class Database:
             )
         return normalized
 
+    def remove_watch_symbol(self, symbol: str, profile: str = "primary") -> bool:
+        normalized = _normalize_symbol(symbol)
+        if not normalized:
+            raise ValueError("symbol is required")
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE watchlist
+                SET enabled = 0
+                WHERE symbol = ? AND profile = ? AND enabled = 1
+                """,
+                (normalized, profile),
+            )
+        return result.rowcount > 0
+
     @staticmethod
     def _ensure_default_movement_alert_settings(conn: sqlite3.Connection) -> None:
         conn.execute(

@@ -95,7 +95,13 @@ def _next_overnight_start(current: datetime) -> datetime:
 
 def _regular_interval_seconds(current: datetime) -> int:
     regular_open = current.replace(hour=9, minute=30, second=0, microsecond=0)
-    opening_high_frequency_end = regular_open + timedelta(minutes=90)
-    if regular_open <= current < opening_high_frequency_end:
+    first_hour_end = regular_open + timedelta(hours=1)
+    midday_fast_end = regular_open + timedelta(hours=2, minutes=30)
+    late_session_start = current.replace(hour=14, minute=30, second=0, microsecond=0)
+    if regular_open <= current < first_hour_end:
         return 60
-    return 30 * 60
+    if first_hour_end <= current < midday_fast_end:
+        return 5 * 60
+    if midday_fast_end <= current < late_session_start:
+        return 10 * 60
+    return 2 * 60

@@ -23,6 +23,8 @@ class MovementAlert:
     window_minutes: int
     drop_pct: float
     peak_price: float
+    volume_ratio: float
+    level_context: str
     event_key: str
     timestamp_utc: datetime
 
@@ -40,6 +42,7 @@ def build_movement_alerts(
         return []
 
     recent = candles_1m.sort_values("timestamp").tail(max(window_minutes, 2))
+    baseline = candles_1m.sort_values("timestamp").tail(max(window_minutes * 3, len(recent)))
     closes = recent["close"].astype(float)
     latest_price = float(closes.iloc[-1])
     peak_price = float(closes.max())
@@ -56,6 +59,10 @@ def build_movement_alerts(
     )
     tier = _matching_tier(move_pct, thresholds_by_event[event_type])
     if tier is None:
+        return []
+    volume_ratio = _volume_ratio(recent, baseline)
+    level_context = _level_context(symbol_or_snapshot, latest_price, event_type)
+    if volume_ratio < 1.8 and level_context == "none":
         return []
 
     symbol = _symbol_from(symbol_or_snapshot)
@@ -81,6 +88,8 @@ def build_movement_alerts(
             window_minutes=min(window_minutes, len(recent)),
             drop_pct=move_pct,
             peak_price=anchor_price,
+            volume_ratio=volume_ratio,
+            level_context=level_context,
             event_key=event_key,
             timestamp_utc=timestamp,
         )
@@ -99,6 +108,7 @@ def format_movement_alert(alert: MovementAlert) -> str:
             f"【{title}】{alert.symbol}｜{move_label} {alert.tier}档预警",
             "----------------",
             f"{alert.window_minutes}分钟 {signed_pct}｜现价 {alert.latest_price:.2f}｜{anchor_label} {alert.peak_price:.2f}",
+            f"量能放大 {alert.volume_ratio:.2f}x｜位置 {alert.level_context}",
             f"本档告警 {alert.repeat_count} 次｜第 {alert.tier} 档",
             f"动作：{action}",
             tip,
@@ -128,6 +138,8 @@ def build_movement_alert_card(alert: MovementAlert) -> dict:
                     f"**{move_label}**：{signed_pct}\n"
                     f"**现价**：{alert.latest_price:.2f}\n"
                     f"**{anchor_label}**：{alert.peak_price:.2f}\n"
+                    f"**量能放大**：{alert.volume_ratio:.2f}x\n"
+                    f"**位置**：{alert.level_context}\n"
                     f"**本档告警**：{alert.repeat_count} 次｜第 {alert.tier} 档\n"
                     f"**动作**：{action}\n"
                     f"**提示**：{tip}"
@@ -216,3 +228,40 @@ def _bucket(timestamp: datetime) -> str:
     current = timestamp.astimezone(timezone.utc)
     bucket_minute = (current.minute // 30) * 30
     return f"{current.hour:02d}{bucket_minute:02d}"
+
+
+def _volume_ratio(recent: pd.DataFrame, baseline: pd.DataFrame) -> float:
+    if recent.empty or baseline.empty or "volume" not in recent or "volume" not in baseline:
+        return 1.0
+    recent_avg = float(recent["volume"].astype(float).tail(min(3, len(recent))).mean())
+    baseline_window = baseline["volume"].astype(float).head(max(len(baseline) - min(3, len(recent)), 1))
+    baseline_avg = float(baseline_window.mean()) if not baseline_window.empty else 0.0
+    if baseline_avg <= 0:
+        return 1.0
+    return recent_avg / baseline_avg
+
+
+def _level_context(symbol_or_snapshot: str | TechnicalSnapshot, latest_price: float, event_type: str) -> str:
+    if isinstance(symbol_or_snapshot, str):
+        return "none"
+    atr = symbol_or_snapshot.atr_14 or 0.0
+    threshold = max(atr * 0.5, latest_price * 0.003)
+    if event_type == "fast_drop":
+        support = _nearest_level(symbol_or_snapshot.support_levels, latest_price, prefer="support")
+        if support is not None and abs(latest_price - support) <= threshold:
+            return "near_support"
+        return "none"
+    resistance = _nearest_level(symbol_or_snapshot.resistance_levels, latest_price, prefer="resistance")
+    if resistance is not None and abs(resistance - latest_price) <= threshold:
+        return "near_resistance"
+    return "none"
+
+
+def _nearest_level(levels: Sequence[float], close: float, prefer: str) -> float | None:
+    if not levels:
+        return None
+    if prefer == "support":
+        candidates = [level for level in levels if level <= close]
+        return max(candidates) if candidates else max(levels)
+    candidates = [level for level in levels if level >= close]
+    return min(candidates) if candidates else min(levels)

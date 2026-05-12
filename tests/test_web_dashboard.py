@@ -124,6 +124,7 @@ def test_dashboard_repository_returns_latest_symbol_state(tmp_path):
     assert state[0]["entry_zone"] == [99, 100]
     assert state[0]["stop_loss"] == 96
     assert state[0]["take_profit"] == [104, 106]
+    assert state[0]["data_freshness"]["state"] == "stale"
 
 
 def test_dashboard_repository_does_not_fetch_live_quotes_by_default(tmp_path, monkeypatch):
@@ -139,6 +140,7 @@ def test_dashboard_repository_does_not_fetch_live_quotes_by_default(tmp_path, mo
 
     assert state[0]["last_price"] == 100
     assert state[0]["price_source"] == "feature_snapshot"
+    assert state[0]["data_freshness"]["state"] == "no_data"
 
 
 def test_dashboard_page_shows_direction_and_targets_on_symbol_cards(tmp_path, monkeypatch):
@@ -345,6 +347,34 @@ def test_dashboard_api_can_add_watchlist_symbol(tmp_path, monkeypatch):
     assert "NVDA" in watchlist
 
 
+def test_dashboard_api_can_remove_watchlist_symbol(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.add_watch_symbol("CRCL", profile="primary")
+    app = create_app(database_path=db.path, chart_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.delete("/api/watchlist/CRCL")
+    watchlist = client.get("/api/watchlist").json()["watchlist"]["primary"]
+
+    assert response.status_code == 200
+    assert "CRCL" not in watchlist
+
+
+def test_dashboard_page_renders_remove_controls_for_primary_watchlist(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.add_watch_symbol("CRCL", profile="primary")
+    app = create_app(database_path=db.path, chart_dir=tmp_path)
+
+    response = TestClient(app).get("/")
+
+    assert 'data-remove-symbol="CRCL"' in response.text
+    assert "移除" in response.text
+
+
 def test_dashboard_can_update_movement_alert_thresholds(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
     db = Database(tmp_path / "dashboard.db")
@@ -382,6 +412,43 @@ def test_dashboard_sorts_primary_symbols_by_urgency(tmp_path, monkeypatch):
 
     assert response.text.index('data-symbol="HIGH"') < response.text.index('data-symbol="LOW"')
     assert "当前动作" in response.text
+    assert "AI 已触发提醒" in response.text
+
+
+def test_dashboard_api_status_includes_priority_views(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot().model_copy(update={"symbol": "LOW", "close": 10}))
+    db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
+    db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
+    db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+
+    payload = TestClient(app).get("/api/status").json()
+
+    assert "priority_views" in payload
+    assert payload["priority_views"]["most_urgent"][0]["symbol"] == "HIGH"
+    assert payload["priority_views"]["most_actionable"][0]["symbol"] == "HIGH"
+    assert "AI 已触发提醒" in payload["priority_views"]["most_urgent"][0]["explanation"]
+
+
+def test_dashboard_page_renders_priority_views_at_top(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot().model_copy(update={"symbol": "LOW", "close": 10}))
+    db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
+    db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
+    db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+
+    response = TestClient(app).get("/")
+
+    assert "优先关注" in response.text
+    assert "最紧急" in response.text
+    assert "最可执行" in response.text
+    assert "HIGH" in response.text
     assert "AI 已触发提醒" in response.text
 
 

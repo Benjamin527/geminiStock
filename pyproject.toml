@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "US stock AI watchlist and alert assistant for CONL, TSLL, SPY, and QQQ."
 requires-python = ">=3.11"
 dependencies = [
+  "ddtrace==4.8.3",
   "fastapi==0.136.1",
   "google-genai==1.74.0",
   "matplotlib==3.10.9",

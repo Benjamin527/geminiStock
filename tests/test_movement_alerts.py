@@ -33,7 +33,7 @@ def _technical(symbol: str = "TSLL", close: float = 12.18, rsi: float | None = 3
 
 def _candles(prices: list[float], volumes: list[int] | None = None) -> pd.DataFrame:
     start = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
-    volumes = volumes or [1000 for _ in prices]
+    volumes = volumes or [400 for _ in prices[:-3]] + [2200, 2400, 2600]
     return pd.DataFrame(
         [
             {
@@ -169,3 +169,34 @@ def test_small_move_does_not_create_alert():
     )
 
     assert alerts == []
+
+
+def test_fast_drop_without_volume_confirmation_does_not_alert():
+    alerts = build_movement_alerts(
+        "TSLL",
+        _candles(
+            [12.42, 12.38, 12.34, 12.31, 12.28, 12.24, 12.21, 12.19, 12.18, 12.18],
+            volumes=[1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000],
+        ),
+        profile="primary",
+        trading_date="2026-01-05",
+        threshold_pcts=[1.2, 2.0, 3.0],
+    )
+
+    assert alerts == []
+
+
+def test_fast_drop_with_volume_confirmation_can_alert_without_snapshot_levels():
+    alerts = build_movement_alerts(
+        "TSLL",
+        _candles(
+            [12.42, 12.38, 12.34, 12.31, 12.28, 12.24, 12.21, 12.19, 12.18, 12.18],
+            volumes=[400, 420, 450, 460, 500, 520, 2500, 2600, 2700, 2800],
+        ),
+        profile="primary",
+        trading_date="2026-01-05",
+        threshold_pcts=[1.2, 2.0, 3.0],
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].event_type == "fast_drop"

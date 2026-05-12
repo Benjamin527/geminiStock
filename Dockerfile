@@ -16,4 +16,4 @@ COPY tests /app/tests
 RUN pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir -e '.[dev]'
 
-CMD ["python", "-m", "gemini_stock.main"]
+CMD ["ddtrace-run", "python", "-m", "gemini_stock.main"]

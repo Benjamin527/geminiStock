@@ -77,6 +77,7 @@ def create_app(
             errors=repo.get_recent_errors(symbols_now),
             watchlist=watchlist_payload(),
             movement_alert_settings=movement_alert_settings_payload(),
+            priority_views=repo.build_priority_views(symbols_now, benchmarks_now),
         )
 
     @app.get("/api/status")
@@ -94,6 +95,7 @@ def create_app(
             "recent_errors": repo.get_recent_errors(symbols_now),
             "watchlist": watchlist_payload(),
             "movement_alert_settings": movement_alert_settings_payload(),
+            "priority_views": repo.build_priority_views(symbols_now, benchmarks_now),
         }
 
     @app.get("/api/health")
@@ -151,6 +153,20 @@ def create_app(
         return {
             "ok": True,
             "symbol": added_symbol,
+            "watchlist": watchlist_payload(),
+        }
+
+    @app.delete("/api/watchlist/{symbol}")
+    def api_remove_watch_symbol(symbol: str) -> dict:
+        normalized_symbol = symbol.upper().strip()
+        if not re.fullmatch(r"[A-Z0-9._-]{1,10}", normalized_symbol):
+            raise HTTPException(status_code=422, detail="symbol must be 1-10 chars and only contain A-Z, 0-9, dot, underscore, or hyphen")
+        removed = db.remove_watch_symbol(normalized_symbol, profile="primary")
+        if not removed:
+            raise HTTPException(status_code=404, detail="symbol is not in primary watchlist")
+        return {
+            "ok": True,
+            "symbol": normalized_symbol,
             "watchlist": watchlist_payload(),
         }
 
@@ -294,6 +310,7 @@ def render_dashboard(
     errors: list[dict],
     watchlist: dict[str, list[str]],
     movement_alert_settings: dict,
+    priority_views: dict[str, list[dict]] | None = None,
 ) -> str:
     ordered_symbols = sorted(symbols, key=_symbol_sort_key)
     symbol_cards = "\n".join(_render_symbol_card(item) for item in ordered_symbols)
@@ -346,6 +363,32 @@ def render_dashboard(
     ) or "<li class='muted-row'>暂无近期错误</li>"
     monitored_primary = " · ".join(watchlist.get("primary") or [])
     monitored_benchmark = " · ".join(watchlist.get("benchmark") or [])
+    priority_views = priority_views or {}
+    priority_sections = [
+        ("最紧急", priority_views.get("most_urgent", [])),
+        ("最异常", priority_views.get("most_abnormal", [])),
+        ("最可执行", priority_views.get("most_actionable", [])),
+    ]
+    priority_cards = "".join(
+        f"""
+        <div class="priority-group">
+          <h3>{title}</h3>
+          <div class="priority-list">
+            {''.join(_render_priority_item(item) for item in items) or "<div class='priority-item muted-row'>暂无数据</div>"}
+          </div>
+        </div>
+        """
+        for title, items in priority_sections
+    )
+    primary_watch_items = "".join(
+        f"""
+        <div class="watch-chip">
+          <span class="watch-badge">{symbol}</span>
+          <button class="watch-remove" type="button" data-remove-symbol="{symbol}" aria-label="移除 {symbol}">移除</button>
+        </div>
+        """
+        for symbol in watchlist.get("primary", [])
+    ) or "<span class='watch-badge'>暂无</span>"
     drop_thresholds = movement_alert_settings.get("fast_drop") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
     rise_thresholds = movement_alert_settings.get("fast_rise") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
     countdown_seconds = int(status.get("countdown_seconds") or 0)
@@ -375,7 +418,18 @@ def render_dashboard(
     .watch-panel {{ display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }}
     .watch-meta {{ display: grid; gap: 8px; }}
     .watch-badges {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .watch-chip {{ display: inline-flex; align-items: center; gap: 6px; }}
     .watch-badge {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; color: var(--ink); background: rgba(102,183,255,.08); }}
+    .watch-remove {{
+      border: 1px solid rgba(255,255,255,.14);
+      border-radius: 999px;
+      background: rgba(255,255,255,.04);
+      color: var(--muted);
+      font-size: 12px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }}
+    .watch-remove:hover {{ color: var(--ink); border-color: rgba(255,255,255,.24); }}
     .watch-form {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
     .watch-input {{
       width: 180px;
@@ -431,6 +485,14 @@ def render_dashboard(
     .metric span, .stat span {{ color: var(--muted); display: block; font-size: 12px; }}
     .metric.primary span {{ color: #b9c4bd; }}
     .overview {{ display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 12px; }}
+    .priority-board {{ margin-top: 12px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+    .priority-group {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
+    .priority-group h3 {{ margin: 0 0 10px; font-size: 14px; color: var(--muted); }}
+    .priority-list {{ display: grid; gap: 8px; }}
+    .priority-item {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #121b27; }}
+    .priority-item b {{ display: block; font-size: 15px; }}
+    .priority-meta {{ display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; margin-top: 4px; }}
+    .priority-score {{ color: var(--ink); font-weight: 700; }}
     .stats {{ display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; }}
     .stat b {{ display: block; margin-top: 2px; font-size: 24px; }}
     .cost-panel h2 {{ margin-bottom: 10px; }}
@@ -534,6 +596,7 @@ def render_dashboard(
     .muted-row {{ color: var(--muted); }}
     @media (max-width: 980px) {{
       .status, .overview, .split {{ grid-template-columns: 1fr; }}
+      .priority-board {{ grid-template-columns: 1fr; }}
       .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .watch-panel {{ grid-template-columns: 1fr; }}
       .watch-form {{ justify-content: flex-start; }}
@@ -586,6 +649,10 @@ def render_dashboard(
         <div class="metric"><span>今日报警 / 错误</span><b>{metrics['alerts_today']} / {metrics['llm_errors_today']}</b></div>
         <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
       </div>
+      <h2 style="margin:14px 0 10px;">优先关注</h2>
+      <div class="priority-board">
+        {priority_cards}
+      </div>
     </section>
     <div class="sub">{'配置提醒：本地 .env 含敏感字段 ' + warning_text + '，建议轮换并移入密钥管理。' if warning_text else ''}</div>
     <details class="settings-drawer" data-panel="settings">
@@ -597,7 +664,7 @@ def render_dashboard(
             <div class="watch-meta">
               <div class="sub">主监控：{monitored_primary or '-'}</div>
               <div class="sub">参考监控：{monitored_benchmark or '-'}</div>
-              <div class="watch-badges">{''.join(f"<span class='watch-badge'>{symbol}</span>" for symbol in watchlist.get('primary', [])) or "<span class='watch-badge'>暂无</span>"}</div>
+              <div class="watch-badges">{primary_watch_items}</div>
             </div>
             <form class="watch-form" id="watch-form">
               <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
@@ -729,6 +796,26 @@ def render_dashboard(
         }}
       }});
     }}
+
+    document.querySelectorAll("[data-remove-symbol]").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        const symbol = button.dataset.removeSymbol;
+        if (!symbol) return;
+        try {{
+          const response = await fetch(`/api/watchlist/${{encodeURIComponent(symbol)}}`, {{
+            method: "DELETE",
+          }});
+          if (!response.ok) {{
+            const data = await response.json().catch(() => ({{}}));
+            alert(data.detail || "移除失败，请稍后再试");
+            return;
+          }}
+          location.reload();
+        }} catch (_) {{
+          alert("网络异常，稍后再试");
+        }}
+      }});
+    }});
 
     const movementSettingsForm = document.getElementById("movement-settings-form");
     if (movementSettingsForm) {{
@@ -896,6 +983,23 @@ def _render_llm_mobile_card(row: dict) -> str:
       <div class="feed-meta">{_label(row['analysis_level'])} · 传图 {'是' if row['has_image'] else '否'} · 视觉复核 {_label(row['visual_confirmation'])}</div>
       <div>分数 {_fmt(row['sentiment_score'])} · 置信度 {_fmt(row['confidence'])}</div>
       <div class="feed-meta">{_fmt(row['error']) if row['error'] else '无异常'}</div>
+    </div>
+    """
+
+
+def _render_priority_item(item: dict) -> str:
+    return f"""
+    <div class="priority-item">
+      <b>{item.get('symbol', '-')}</b>
+      <div class="priority-meta">
+        <span>{_label(item.get('bias'))} · {_label(item.get('setup_type'))}</span>
+        <span class="priority-score">{_fmt(item.get('score'))}</span>
+      </div>
+      <div class="priority-meta">
+        <span>新鲜度 {_label(item.get('freshness'))}</span>
+        <span>{item.get('distance_label') or '位置距离 -'}</span>
+      </div>
+      <div class="feed-meta">{item.get('explanation') or '当前关注度相对更高'}</div>
     </div>
     """
 

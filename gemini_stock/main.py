@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timezone
+from typing import Iterator
 
 import pandas as pd
+
+try:
+    from ddtrace import tracer as ddtrace_tracer
+except Exception:  # pragma: no cover - fallback only used when dependency is absent locally
+    ddtrace_tracer = None
 
 from gemini_stock.benchmarks import build_benchmark_forecast
 from gemini_stock.charts.renderer import ChartRenderer
@@ -43,6 +51,31 @@ from gemini_stock.storage.db import Database
 logger = logging.getLogger(__name__)
 
 
+def _tracing_env_configured(env: dict[str, str | None] | None = None) -> bool:
+    values = env or os.environ
+    return any(
+        values.get(name)
+        for name in ("DD_AGENT_HOST", "DD_AGENT_PORT", "DD_TRACE_AGENT_PORT", "DD_SERVICE")
+    )
+
+
+tracer = (
+    ddtrace_tracer
+    if ddtrace_tracer is not None and _tracing_env_configured()
+    else None
+)
+
+
+@contextmanager
+def _trace_span(name: str, **tags) -> Iterator[object | None]:
+    span_context = tracer.trace(name) if tracer is not None else nullcontext(None)
+    with span_context as span:
+        if span is not None:
+            for key, value in tags.items():
+                span.set_tag(key, value)
+        yield span
+
+
 @dataclass
 class SymbolRunResult:
     symbol: str
@@ -63,13 +96,8 @@ class RuntimeContext:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> RuntimeContext:
-        data_provider = (
-            YFinanceMarketDataProvider(settings.delayed_data_tolerance_minutes)
-            if settings.data_provider == "yfinance"
-            else create_market_data_provider(settings)
-        )
         return cls(
-            data_provider=data_provider,
+            data_provider=create_market_data_provider(settings),
             news_provider=YFinanceNewsProvider() if settings.news_provider == "yfinance" else NullNewsProvider(),
             renderer=ChartRenderer(settings.chart_dir),
             analyzer=create_analyzer(settings),
@@ -120,112 +148,112 @@ def run_symbol(
     context: RuntimeContext | None = None,
 ) -> SymbolRunResult | None:
     runtime = context or RuntimeContext.from_settings(settings)
+    with _trace_span("worker.run_symbol", symbol=symbol, profile=profile):
+        logger.info("symbol_run_started", extra={"symbol": symbol})
+        candles_1m = runtime.data_provider.get_ohlcv(symbol, "1m", settings.yfinance_period_1m)
+        candles_15m = runtime.data_provider.get_ohlcv(symbol, "15m", settings.yfinance_period_15m)
+        db.save_candles(candles_from_frame(symbol, "1m", candles_1m))
+        db.save_candles(candles_from_frame(symbol, "15m", candles_15m))
 
-    logger.info("symbol_run_started", extra={"symbol": symbol})
-    candles_1m = runtime.data_provider.get_ohlcv(symbol, "1m", settings.yfinance_period_1m)
-    candles_15m = runtime.data_provider.get_ohlcv(symbol, "15m", settings.yfinance_period_15m)
-    db.save_candles(candles_from_frame(symbol, "1m", candles_1m))
-    db.save_candles(candles_from_frame(symbol, "15m", candles_15m))
+        snapshot = build_technical_snapshot(symbol, candles_15m)
+        db.save_feature(snapshot)
+        trading_date = None
+        if not candles_1m.empty:
+            latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
+            trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
+            maybe_send_movement_alerts(settings, db, snapshot, candles_1m, profile=profile, trading_date=trading_date)
+        existing_signal = db.get_successful_signal_for_snapshot(symbol, snapshot.timestamp_utc)
+        if existing_signal is not None:
+            logger.info("llm_analysis_skipped_same_snapshot", extra={"symbol": symbol, "snapshot_timestamp": snapshot.timestamp_utc.isoformat()})
+            result = SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=existing_signal, candles_1m=candles_1m)
+            if profile == "primary":
+                maybe_send_price_action_alerts(settings, db, symbol, existing_signal, candles_1m)
+            return result
 
-    snapshot = build_technical_snapshot(symbol, candles_15m)
-    db.save_feature(snapshot)
-    trading_date = None
-    if not candles_1m.empty:
-        latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
-        trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
-        maybe_send_movement_alerts(settings, db, snapshot, candles_1m, profile=profile, trading_date=trading_date)
-    existing_signal = db.get_successful_signal_for_snapshot(symbol, snapshot.timestamp_utc)
-    if existing_signal is not None:
-        logger.info("llm_analysis_skipped_same_snapshot", extra={"symbol": symbol, "snapshot_timestamp": snapshot.timestamp_utc.isoformat()})
-        result = SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=existing_signal, candles_1m=candles_1m)
-        if profile == "primary":
-            maybe_send_price_action_alerts(settings, db, symbol, existing_signal, candles_1m)
-        return result
+        news = runtime.news_provider.get_news([symbol])
+        db.save_news(news)
+        news_summary = build_news_summary(news)
+        technical_events = build_technical_events(candles_15m, snapshot)
+        analysis_input = build_analysis_input(symbol, candles_15m, snapshot, technical_events, news_summary)
 
-    news = runtime.news_provider.get_news([symbol])
-    db.save_news(news)
-    news_summary = build_news_summary(news)
-    technical_events = build_technical_events(candles_15m, snapshot)
-    analysis_input = build_analysis_input(symbol, candles_15m, snapshot, technical_events, news_summary)
-
-    level1_input = {
-        "analysis_level": "json_only",
-        "has_image": False,
-        "symbol_profile": profile,
-        "symbol": symbol,
-        "technical_snapshot": analysis_input.json_dict(),
-        "technical_events": technical_events,
-        "news_summary": news_summary,
-    }
-    try:
-        level1_signal, fallback_error = analyze_json_only_with_fallback(
-            runtime.analyzer,
-            runtime.fallback_analyzer,
-            analysis_input,
-            settings,
-        )
-        if fallback_error:
-            level1_input["fallback_reason"] = fallback_error
-            level1_input["fallback_used"] = True
-        db.save_llm_output(symbol, level1_input, level1_signal.json_dict(), None)
-    except GeminiAnalysisError as exc:
-        db.save_llm_output(symbol, level1_input, None, str(exc))
-        logger.error("gemini_analysis_failed", extra={"symbol": symbol, "error": str(exc)})
-        return None
-
-    final_signal = level1_signal
-    if profile == "primary" and is_strong_candidate(snapshot, analysis_input, technical_events, news, level1_signal):
-        image_path = runtime.renderer.render_simplified(symbol, candles_15m, snapshot)
-        level2_input = {
-            "analysis_level": "multimodal_review",
-            "has_image": True,
+        level1_input = {
+            "analysis_level": "json_only",
+            "has_image": False,
             "symbol_profile": profile,
             "symbol": symbol,
             "technical_snapshot": analysis_input.json_dict(),
             "technical_events": technical_events,
             "news_summary": news_summary,
-            "preliminary_signal": level1_signal.json_dict(),
-            "simplified_chart_image_path": str(image_path),
         }
         try:
-            final_signal = runtime.analyzer.review_multimodal(analysis_input, level1_signal, image_path)
-            db.save_llm_output(symbol, level2_input, final_signal.json_dict(), None)
+            level1_signal, fallback_error = analyze_json_only_with_fallback(
+                runtime.analyzer,
+                runtime.fallback_analyzer,
+                analysis_input,
+                settings,
+            )
+            if fallback_error:
+                level1_input["fallback_reason"] = fallback_error
+                level1_input["fallback_used"] = True
+            db.save_llm_output(symbol, level1_input, level1_signal.json_dict(), None)
         except GeminiAnalysisError as exc:
-            db.save_llm_output(symbol, level2_input, None, str(exc))
-            logger.error("gemini_multimodal_review_failed", extra={"symbol": symbol, "error": str(exc)})
+            db.save_llm_output(symbol, level1_input, None, str(exc))
+            logger.error("gemini_analysis_failed", extra={"symbol": symbol, "error": str(exc)})
             return None
 
-    if isinstance(rules, BenchmarkAlertRuleEngine):
-        decision = rules.evaluate(final_signal, snapshot, candles_1m)
-    else:
-        decision = rules.evaluate(final_signal, snapshot)
-    result = SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=final_signal, candles_1m=candles_1m)
-    if profile == "primary" and (decision.should_alert or decision.reason == "cooldown_active"):
-        maybe_send_price_action_alerts(settings, db, symbol, final_signal, candles_1m)
-    if not decision.should_alert:
-        logger.info("alert_skipped", extra={"symbol": symbol, "reason": decision.reason})
+        final_signal = level1_signal
+        if profile == "primary" and is_strong_candidate(snapshot, analysis_input, technical_events, news, level1_signal):
+            image_path = runtime.renderer.render_simplified(symbol, candles_15m, snapshot)
+            level2_input = {
+                "analysis_level": "multimodal_review",
+                "has_image": True,
+                "symbol_profile": profile,
+                "symbol": symbol,
+                "technical_snapshot": analysis_input.json_dict(),
+                "technical_events": technical_events,
+                "news_summary": news_summary,
+                "preliminary_signal": level1_signal.json_dict(),
+                "simplified_chart_image_path": str(image_path),
+            }
+            try:
+                final_signal = runtime.analyzer.review_multimodal(analysis_input, level1_signal, image_path)
+                db.save_llm_output(symbol, level2_input, final_signal.json_dict(), None)
+            except GeminiAnalysisError as exc:
+                db.save_llm_output(symbol, level2_input, None, str(exc))
+                logger.error("gemini_multimodal_review_failed", extra={"symbol": symbol, "error": str(exc)})
+                return None
+
+        if isinstance(rules, BenchmarkAlertRuleEngine):
+            decision = rules.evaluate(final_signal, snapshot, candles_1m)
+        else:
+            decision = rules.evaluate(final_signal, snapshot)
+        result = SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=final_signal, candles_1m=candles_1m)
+        if profile == "primary" and (decision.should_alert or decision.reason == "cooldown_active"):
+            maybe_send_price_action_alerts(settings, db, symbol, final_signal, candles_1m)
+        if not decision.should_alert:
+            logger.info("alert_skipped", extra={"symbol": symbol, "reason": decision.reason})
+            return result
+
+        alert_trading_date = trading_date
+        if alert_trading_date is None:
+            latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
+            alert_trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
+        event_key = build_decision_alert_event_key(decision, alert_trading_date)
+        payload = decision.json_dict()
+        payload["event_key"] = event_key
+        payload["type"] = "benchmark_alert" if isinstance(rules, BenchmarkAlertRuleEngine) else "primary_alert"
+        for notifier in runtime.notifiers:
+            try:
+                if not should_send_decision_alert(db, notifier.channel, decision, event_key, datetime.now(timezone.utc), settings.alert_cooldown_minutes):
+                    logger.info("alert_skipped", extra={"symbol": symbol, "reason": "persistent_cooldown_or_duplicate", "channel": notifier.channel})
+                    continue
+                sent = notifier.send(decision)
+                if sent:
+                    db.save_alert(symbol, payload, notifier.channel)
+            except Exception as exc:
+                logger.error("notification_failed", extra={"symbol": symbol, "channel": notifier.channel, "error": str(exc)})
+
         return result
-
-    alert_trading_date = trading_date
-    if alert_trading_date is None:
-        latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
-        alert_trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
-    event_key = build_decision_alert_event_key(decision, alert_trading_date)
-    payload = decision.json_dict()
-    payload["event_key"] = event_key
-    payload["type"] = "benchmark_alert" if isinstance(rules, BenchmarkAlertRuleEngine) else "primary_alert"
-    for notifier in runtime.notifiers:
-        try:
-            if not should_send_decision_alert(db, notifier.channel, decision, event_key, datetime.now(timezone.utc), settings.alert_cooldown_minutes):
-                logger.info("alert_skipped", extra={"symbol": symbol, "reason": "persistent_cooldown_or_duplicate", "channel": notifier.channel})
-                continue
-            sent = notifier.send(decision)
-            if sent:
-                db.save_alert(symbol, payload, notifier.channel)
-        except Exception as exc:
-            logger.error("notification_failed", extra={"symbol": symbol, "channel": notifier.channel, "error": str(exc)})
-
-    return result
 
 
 def run_once(settings: Settings) -> None:
@@ -234,31 +262,40 @@ def run_once(settings: Settings) -> None:
     primary_symbols = db.list_watch_symbols("primary") or settings.symbols
     benchmark_symbols = db.list_watch_symbols("benchmark") or settings.benchmark_symbols
     context = RuntimeContext.from_settings(settings)
-    primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
-    benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
-    benchmark_results: list[SymbolRunResult] = []
-    for symbol in primary_symbols:
-        try:
-            run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context)
-        except MarketDataError as exc:
-            db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
-            logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
-        except Exception as exc:
-            logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
-    for symbol in benchmark_symbols:
-        try:
-            result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context)
-            if result is not None:
-                benchmark_results.append(result)
-        except MarketDataError as exc:
-            db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
-            logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
-        except Exception as exc:
-            logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
-    run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
-    maybe_send_premarket_brief(settings, db, benchmark_results)
-    run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
-    maybe_send_opening_silence_self_check(settings, db, primary_symbols)
+    with _trace_span(
+        "worker.run_once",
+        data_provider=settings.data_provider,
+        llm_provider=settings.llm_provider,
+        symbol_count=len(primary_symbols),
+        benchmark_symbol_count=len(benchmark_symbols),
+    ):
+        primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
+        benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
+        benchmark_results: list[SymbolRunResult] = []
+        for symbol in primary_symbols:
+            try:
+                run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context)
+            except MarketDataError as exc:
+                db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
+                logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
+            except Exception as exc:
+                logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
+        for symbol in benchmark_symbols:
+            try:
+                result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context)
+                if result is not None:
+                    benchmark_results.append(result)
+            except MarketDataError as exc:
+                db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
+                logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
+            except Exception as exc:
+                logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
+        with _trace_span("worker.run_movement_only"):
+            run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
+        maybe_send_premarket_brief(settings, db, benchmark_results)
+        with _trace_span("worker.maintenance"):
+            run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
+        maybe_send_opening_silence_self_check(settings, db, primary_symbols)
 
 
 def run_movement_only_once(
@@ -590,15 +627,17 @@ def maybe_send_movement_alerts(
                         "event_type": alert.event_type,
                         "tier": alert.tier,
                         "repeat_index": repeat_index,
-                        "repeat_count": alert.repeat_count,
-                        "latest_price": alert.latest_price,
-                        "peak_price": alert.peak_price,
-                        "drop_pct": alert.drop_pct,
-                        "window_minutes": alert.window_minutes,
-                        "text": text,
-                    },
-                    "feishu",
-                )
+                    "repeat_count": alert.repeat_count,
+                    "latest_price": alert.latest_price,
+                    "peak_price": alert.peak_price,
+                    "drop_pct": alert.drop_pct,
+                    "volume_ratio": alert.volume_ratio,
+                    "level_context": alert.level_context,
+                    "window_minutes": alert.window_minutes,
+                    "text": text,
+                },
+                "feishu",
+            )
                 sent_count += 1
     return sent_count
 

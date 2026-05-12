@@ -30,7 +30,7 @@ OPENAI_API_KEY=你的 OpenAI-compatible API Key
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
 LLM_FALLBACK_ON_ERROR=true
-DATA_PROVIDER=yfinance
+DATA_PROVIDER=auto
 NEWS_PROVIDER=none
 MOVEMENT_ALERT_SYMBOLS=["BTC-USD"]
 POLYGON_API_KEY=
@@ -75,6 +75,8 @@ Docker：
 cp .env.example .env
 docker compose up --build
 ```
+
+默认 Docker 启动会通过 `ddtrace-run` 为 `worker` 和 `dashboard` 两个容器开启链路上报，并把 trace 发到 `.env` 中配置的 Guance agent 地址；示例默认值是 `121.196.154.93:9529`。
 
 ## Web 控制台
 
@@ -144,7 +146,7 @@ AVERAGE_COSTS={"CONL":45.00,"TSLL":12.30}
 
 ## 数据源说明
 
-默认使用 yfinance 做原型。后台拉取 intraday 数据时会开启盘前 / 盘后数据，并在自动运行时段校验最新 K 线是否超过延迟容忍窗口；如果 yfinance 只返回上一交易日常规盘数据，系统会跳过本轮分析，避免用陈旧价格触发报警。控制台读取后台已保存的 K 线缓存，不会自行触发行情请求。yfinance 的 intraday 数据适合验证流程，但不建议作为生产盯盘数据源。
+默认使用 `DATA_PROVIDER=auto`。配置 `POLYGON_API_KEY` 时，后台会优先使用 Polygon 作为盘中监控源；未配置时自动回落到 yfinance。后台拉取 intraday 数据时会开启盘前 / 盘后数据，并在自动运行时段校验最新 K 线是否超过延迟容忍窗口；如果 yfinance 只返回上一交易日常规盘数据，系统会跳过本轮分析，避免用陈旧价格触发报警。控制台读取后台已保存的 K 线缓存，不会自行触发行情请求。yfinance 的 intraday 数据适合验证流程，但不建议作为生产盯盘数据源。
 
 系统已经内置 Polygon-compatible 聚合行情源：
 

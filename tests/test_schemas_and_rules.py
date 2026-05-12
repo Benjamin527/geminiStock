@@ -124,6 +124,24 @@ def test_alert_rule_enforces_cooldown():
     assert second.reason == "cooldown_active"
 
 
+def test_alert_rule_cooldown_is_scoped_to_event_family():
+    engine = AlertRuleEngine(cooldown_minutes=60)
+    now = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    buy_signal = _signal().model_copy(update={"symbol": "TSLL", "sentiment_score": 8.0, "confidence": 0.75, "risk_reward_ratio": 2.0})
+    llm_signal = _signal(score=3.2, confidence=0.67, setup_type="breakout").model_copy(
+        update={"symbol": "TSLL", "risk_reward_ratio": 1.1}
+    )
+    technical = _technical().model_copy(update={"symbol": "TSLL"})
+
+    first = engine.evaluate(buy_signal, technical, now=now)
+    second = engine.evaluate(llm_signal, technical, now=now)
+
+    assert first.should_alert is True
+    assert first.reason == "buy_alert"
+    assert second.should_alert is True
+    assert second.reason == "llm_alert"
+
+
 def _one_minute_frame(prices: list[float]) -> pd.DataFrame:
     start = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
     rows = []
@@ -170,3 +188,25 @@ def test_benchmark_alert_rule_triggers_near_key_level():
 
     assert decision.should_alert is True
     assert decision.reason == "benchmark_support_watch"
+
+
+def test_benchmark_alert_rule_cooldown_is_scoped_to_trigger_reason():
+    engine = BenchmarkAlertRuleEngine(cooldown_minutes=60)
+    now = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    signal = _signal(score=-6, confidence=0.75, setup_type="breakdown").model_copy(
+        update={"symbol": "SPY", "bias": "bearish", "should_alert": False}
+    )
+    drop_technical = _technical(rsi=38, close=97.5, ema50=100, atr=2).model_copy(update={"symbol": "SPY"})
+    support_technical = _technical(rsi=52, close=98.1, ema50=99, atr=1).model_copy(
+        update={"symbol": "SPY", "support_levels": [98.0, 97.5], "resistance_levels": [101.5, 102.0]}
+    )
+    sudden_drop = _one_minute_frame([100.2, 99.9, 99.8, 99.2, 98.9, 98.5, 98.1, 97.8, 97.6, 97.5])
+    support_watch = _one_minute_frame([98.4, 98.35, 98.3, 98.2, 98.1])
+
+    first = engine.evaluate(signal, drop_technical, sudden_drop, now=now)
+    second = engine.evaluate(signal, support_technical, support_watch, now=now)
+
+    assert first.should_alert is True
+    assert first.reason == "benchmark_drop_alert"
+    assert second.should_alert is True
+    assert second.reason == "benchmark_support_watch"

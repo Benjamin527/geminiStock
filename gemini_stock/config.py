@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     symbols: list[str] = Field(default_factory=lambda: ["CONL", "TSLL"])
     benchmark_symbols: list[str] = Field(default_factory=lambda: ["SPY", "QQQ"])
     movement_alert_symbols: list[str] = Field(default_factory=lambda: ["BTC-USD"])
-    data_provider: Literal["auto", "yfinance", "polygon"] = "yfinance"
+    data_provider: Literal["auto", "yfinance", "polygon"] = "auto"
     news_provider: Literal["none", "yfinance"] = "none"
 
     llm_provider: Literal["auto", "gemini", "openai", "fallback"] = "auto"

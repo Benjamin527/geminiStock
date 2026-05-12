@@ -1,8 +1,11 @@
 services:
   gemini-stock:
     build: .
+    command: ["ddtrace-run", "python", "-m", "gemini_stock.main"]
     env_file:
       - .env
+    environment:
+      DD_SERVICE: ${DD_SERVICE:-gemini-worker}
     volumes:
       - ./data:/app/data
       - ./charts:/app/charts
@@ -16,9 +19,11 @@ services:
 
   dashboard:
     build: .
-    command: ["python", "-m", "gemini_stock.web.app"]
+    command: ["ddtrace-run", "python", "-m", "gemini_stock.web.app"]
     env_file:
       - .env
+    environment:
+      DD_SERVICE: ${DD_DASHBOARD_SERVICE:-gemini-dashboard}
     ports:
       - "8000:8000"
     volumes:

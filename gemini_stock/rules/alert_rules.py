@@ -21,10 +21,6 @@ class AlertRuleEngine:
         current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         symbol = signal.symbol
 
-        last_alert = self._last_alert_at.get(symbol)
-        if last_alert and current_time - last_alert < self.cooldown:
-            return self._decision(False, "cooldown_active", current_time, signal, technical_snapshot, severity="info")
-
         if not signal.should_alert:
             return self._decision(False, "llm_should_alert is false", current_time, signal, technical_snapshot, severity="info")
         if signal.visual_confirmation == "rejected":
@@ -35,9 +31,17 @@ class AlertRuleEngine:
         if ema_50 is not None and atr_14 is not None and technical_snapshot.close < ema_50 - 2 * atr_14:
             return self._decision(False, "price below EMA50 by more than 2 ATR", current_time, signal, technical_snapshot, severity="info")
 
-        self._last_alert_at[symbol] = current_time
         reason = "buy_alert" if _is_strong_buy_signal(signal, technical_snapshot) else "llm_alert"
+        cooldown_key = self._cooldown_key(symbol, reason, signal)
+        last_alert = self._last_alert_at.get(cooldown_key)
+        if last_alert and current_time - last_alert < self.cooldown:
+            return self._decision(False, "cooldown_active", current_time, signal, technical_snapshot, severity="info")
+        self._last_alert_at[cooldown_key] = current_time
         return self._decision(True, reason, current_time, signal, technical_snapshot, severity=_primary_severity(reason, signal))
+
+    @staticmethod
+    def _cooldown_key(symbol: str, reason: str, signal: GeminiSignal) -> str:
+        return ":".join([symbol, reason, signal.bias or "-", signal.setup_type or "-"])
 
     @staticmethod
     def _decision(
@@ -74,16 +78,20 @@ class BenchmarkAlertRuleEngine:
         current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         symbol = signal.symbol
 
-        last_alert = self._last_alert_at.get(symbol)
-        if last_alert and current_time - last_alert < self.cooldown:
-            return AlertRuleEngine._decision(False, "cooldown_active", current_time, signal, technical_snapshot, severity="info")
-
         reason = self._find_trigger_reason(signal, technical_snapshot, candles_1m)
         if not reason:
             return AlertRuleEngine._decision(False, "benchmark_no_alert", current_time, signal, technical_snapshot, severity="info")
 
-        self._last_alert_at[symbol] = current_time
+        cooldown_key = self._cooldown_key(symbol, reason, signal)
+        last_alert = self._last_alert_at.get(cooldown_key)
+        if last_alert and current_time - last_alert < self.cooldown:
+            return AlertRuleEngine._decision(False, "cooldown_active", current_time, signal, technical_snapshot, severity="info")
+        self._last_alert_at[cooldown_key] = current_time
         return AlertRuleEngine._decision(True, reason, current_time, signal, technical_snapshot, severity=_benchmark_severity(reason))
+
+    @staticmethod
+    def _cooldown_key(symbol: str, reason: str, signal: GeminiSignal) -> str:
+        return ":".join([symbol, reason, signal.bias or "-", signal.setup_type or "-"])
 
     def _find_trigger_reason(
         self,

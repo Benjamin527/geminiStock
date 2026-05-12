@@ -140,3 +140,15 @@ def test_database_watchlist_can_append_and_list_symbols(tmp_path):
 
     assert db.list_watch_symbols("primary") == ["CONL", "TSLL"]
     assert db.list_watch_symbols("benchmark") == ["QQQ"]
+
+
+def test_database_watchlist_can_disable_existing_symbol(tmp_path):
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+
+    db.add_watch_symbol("CRCL", profile="primary")
+
+    removed = db.remove_watch_symbol("crcl", profile="primary")
+
+    assert removed is True
+    assert db.list_watch_symbols("primary") == []
