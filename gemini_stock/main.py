@@ -16,6 +16,7 @@ from gemini_stock.data.yfinance_provider import YFinanceMarketDataProvider, cand
 from gemini_stock.features.analysis_input import build_analysis_input, build_news_summary, is_strong_candidate
 from gemini_stock.features.events import build_technical_events
 from gemini_stock.features.snapshot import build_technical_snapshot
+from gemini_stock.health import evaluate_worker_health
 from gemini_stock.llm.gemini_client import GeminiAnalysisError, GeminiAnalyzer, RuleBasedFallbackAnalyzer
 from gemini_stock.llm.openai_client import OpenAICompatibleAnalyzer
 from gemini_stock.logging_config import configure_logging
@@ -26,7 +27,9 @@ from gemini_stock.notify.channels import (
     FeishuNotifier,
     TelegramNotifier,
     WeComNotifier,
+    build_opening_silence_self_check_card,
     format_premarket_brief,
+    format_opening_silence_self_check,
     send_feishu_interactive_card,
     send_feishu_text,
 )
@@ -255,6 +258,7 @@ def run_once(settings: Settings) -> None:
     run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
     maybe_send_premarket_brief(settings, db, benchmark_results)
     run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
+    maybe_send_opening_silence_self_check(settings, db, primary_symbols)
 
 
 def run_movement_only_once(
@@ -399,6 +403,76 @@ def maybe_send_daily_review(
             },
             "feishu",
         )
+
+
+def maybe_send_opening_silence_self_check(
+    settings: Settings,
+    db: Database,
+    primary_symbols: list[str],
+    now: datetime | None = None,
+) -> bool:
+    current_ny = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
+    schedule = get_schedule_decision(current_ny)
+    if schedule.session != MarketSession.REGULAR:
+        return False
+    if current_ny.time() < dt_time(9, 30) or current_ny.time() >= dt_time(11, 0):
+        return False
+    if db.has_any_recent_alert(current_ny, within_minutes=30):
+        return False
+
+    event_key = f"self_check:opening_silence:{current_ny.date().isoformat()}:{_half_hour_bucket(current_ny)}"
+    if db.has_alert_event("feishu", event_key):
+        return False
+
+    worker_health = evaluate_worker_health(
+        db.get_latest_llm_output_time(),
+        schedule,
+        now=current_ny.astimezone(timezone.utc),
+        stale_after_intervals=settings.worker_stale_after_intervals,
+    )
+    worker_status = _opening_worker_status(worker_health)
+    market_issues = _opening_market_data_issues(
+        db,
+        primary_symbols or settings.symbols,
+        now=current_ny.astimezone(timezone.utc),
+        tolerance_minutes=settings.delayed_data_tolerance_minutes,
+    )
+    if worker_health["is_stale"] is False and not market_issues:
+        return False
+
+    text = format_opening_silence_self_check(
+        current_time_label=current_ny.strftime("%Y-%m-%d %H:%M ET"),
+        worker_status=worker_status,
+        market_data_status="；".join(market_issues) if market_issues else "主监控标的 1m 行情正常",
+    )
+    try:
+        sent = send_feishu_interactive_card(
+            settings.feishu_webhook_url,
+            build_opening_silence_self_check_card(
+                current_time_label=current_ny.strftime("%Y-%m-%d %H:%M ET"),
+                worker_status=worker_status,
+                market_data_status="；".join(market_issues) if market_issues else "主监控标的 1m 行情正常",
+            ),
+            bypass_quiet_hours=True,
+        )
+    except Exception as exc:
+        logger.error("opening_silence_self_check_failed", extra={"event_key": event_key, "error": str(exc)})
+        return False
+    if not sent:
+        return False
+    db.save_alert(
+        "SYSTEM",
+        {
+            "event_key": event_key,
+            "type": "system_self_check",
+            "symbols": primary_symbols,
+            "text": text,
+            "worker_health": worker_health,
+            "market_data_issues": market_issues,
+        },
+        "feishu",
+    )
+    return True
 
 
 def maybe_send_price_action_alerts(
@@ -562,6 +636,39 @@ def _event_zone(values: list[float]) -> str:
         return "-"
     low, high = sorted(float(value) for value in values[:2])
     return f"{low:.2f}-{high:.2f}"
+
+
+def _half_hour_bucket(current: datetime) -> str:
+    bucket_minute = (current.minute // 30) * 30
+    return f"{current.hour:02d}{bucket_minute:02d}"
+
+
+def _opening_worker_status(worker_health: dict) -> str:
+    age_seconds = worker_health.get("age_seconds")
+    if age_seconds is None:
+        return "暂无最近分析结果"
+    age_minutes = max(1, age_seconds // 60)
+    if worker_health.get("is_stale"):
+        return f"最新分析结果距今 {age_minutes} 分钟"
+    return f"最近分析结果正常，距今 {age_minutes} 分钟"
+
+
+def _opening_market_data_issues(
+    db: Database,
+    primary_symbols: list[str],
+    now: datetime,
+    tolerance_minutes: int,
+) -> list[str]:
+    issues: list[str] = []
+    for symbol in primary_symbols:
+        latest_candle = db.get_latest_candle_time(symbol, "1m")
+        if latest_candle is None:
+            issues.append(f"{symbol} 1m 无数据")
+            continue
+        age_minutes = max(0, int((now.astimezone(timezone.utc) - latest_candle).total_seconds() // 60))
+        if age_minutes > tolerance_minutes:
+            issues.append(f"{symbol} 1m 延迟 {age_minutes} 分钟")
+    return issues
 
 
 def main() -> None:

@@ -388,6 +388,48 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def has_any_recent_alert(self, now: datetime, within_minutes: int) -> bool:
+        cutoff = now.astimezone(timezone.utc) - timedelta(minutes=within_minutes)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM alerts
+                WHERE created_at_utc >= ?
+                LIMIT 1
+                """,
+                (cutoff.isoformat(),),
+            ).fetchone()
+        return row is not None
+
+    def get_latest_llm_output_time(self) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at_utc
+                FROM llm_outputs
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return str(row["created_at_utc"]) if row and row["created_at_utc"] else None
+
+    def get_latest_candle_time(self, symbol: str, interval: str) -> datetime | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp_utc
+                FROM raw_candles
+                WHERE symbol = ? AND interval = ?
+                ORDER BY timestamp_utc DESC
+                LIMIT 1
+                """,
+                (symbol, interval),
+            ).fetchone()
+        if row is None or not row["timestamp_utc"]:
+            return None
+        return _parse_datetime(str(row["timestamp_utc"]))
+
     def get_successful_signal_for_snapshot(self, symbol: str, snapshot_timestamp: datetime) -> GeminiSignal | None:
         expected = snapshot_timestamp.astimezone(timezone.utc).isoformat()
         with self.connect() as conn:

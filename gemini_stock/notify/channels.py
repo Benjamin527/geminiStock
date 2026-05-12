@@ -126,6 +126,50 @@ def format_premarket_brief(forecasts: list[BenchmarkForecast], trading_date: str
     return "\n".join(lines)
 
 
+def format_opening_silence_self_check(
+    current_time_label: str,
+    worker_status: str,
+    market_data_status: str,
+) -> str:
+    return "\n".join(
+        [
+            "【运行自检】开盘静默 30 分钟",
+            "----------------",
+            f"时间：{current_time_label}",
+            "结论：发现异常，近 30 分钟没有任何推送",
+            f"Worker：{worker_status}",
+            f"行情：{market_data_status}",
+            "提示：请检查行情源、容器运行状态和通知链路。",
+        ]
+    )
+
+
+def build_opening_silence_self_check_card(
+    current_time_label: str,
+    worker_status: str,
+    market_data_status: str,
+) -> dict:
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "运行自检｜开盘静默 30 分钟"},
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**时间**：{current_time_label}\n"
+                    f"**结论**：发现异常，近 30 分钟没有任何推送\n"
+                    f"**Worker**：{worker_status}\n"
+                    f"**行情**：{market_data_status}\n"
+                    "**提示**：请检查行情源、容器运行状态和通知链路。"
+                ),
+            }
+        ],
+    }
+
+
 def send_feishu_text(
     webhook_url: str | None,
     text: str,
