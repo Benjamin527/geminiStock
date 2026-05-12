@@ -251,6 +251,11 @@ def test_dashboard_page_renders_core_sections(tmp_path, monkeypatch):
     assert "最近执行时间线" in response.text
     assert "今日运行概览" in response.text
     assert "距离下次执行" in response.text
+    assert 'id="next-run-countdown"' in response.text
+    assert "formatCountdown" in response.text
+    assert 'class="top-deck active-panel"' in response.text
+    assert 'class="mobile-tabs"' in response.text
+    assert "<summary>监控与阈值设置</summary>" in response.text
 
 
 def test_dashboard_benchmark_cards_show_regular_session_forecast(tmp_path, monkeypatch):
@@ -338,6 +343,46 @@ def test_dashboard_api_can_add_watchlist_symbol(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert "NVDA" in watchlist
+
+
+def test_dashboard_can_update_movement_alert_thresholds(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    app = create_app(database_path=db.path, chart_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/movement-alert-settings",
+        json={"fast_drop": [3.0, 6.0, 10.0], "fast_rise": [2.0, 4.0, 8.0]},
+    )
+    settings = client.get("/api/movement-alert-settings").json()
+    page = client.get("/")
+
+    assert response.status_code == 200
+    assert settings["fast_drop"] == [3.0, 6.0, 10.0]
+    assert settings["fast_rise"] == [2.0, 4.0, 8.0]
+    assert "价格异动阈值" in page.text
+    assert "下跌 1档 %" in page.text
+    assert "上涨 1档 %" in page.text
+    assert "10.0" in page.text
+
+
+def test_dashboard_sorts_primary_symbols_by_urgency(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot().model_copy(update={"symbol": "LOW", "close": 10}))
+    db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
+    db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
+    db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+
+    response = TestClient(app).get("/")
+
+    assert response.text.index('data-symbol="HIGH"') < response.text.index('data-symbol="LOW"')
+    assert "当前动作" in response.text
+    assert "AI 已触发提醒" in response.text
 
 
 def test_to_beijing_time_handles_sqlite_utc_suffix():

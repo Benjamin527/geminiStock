@@ -5,6 +5,7 @@ from gemini_stock.notify.channels import (
     FeishuNotifier,
     format_alert,
     format_premarket_brief,
+    send_feishu_text,
     send_feishu_interactive_card,
 )
 from gemini_stock.schemas import AlertDecision, GeminiSignal, TechnicalSnapshot
@@ -123,9 +124,37 @@ def test_feishu_notifier_posts_text_payload(monkeypatch):
 
     assert notifier.send(_decision()) is True
     assert captured["url"].endswith("/token")
-    assert captured["json"]["msg_type"] == "text"
-    assert "SPY" in captured["json"]["content"]["text"]
+    assert captured["json"]["msg_type"] == "interactive"
+    assert "SPY" in captured["json"]["card"]["header"]["title"]["content"]
+    assert "SPY" in captured["json"]["card"]["elements"][0]["content"]
     assert captured["timeout"] == 10
+
+
+def test_send_feishu_text_ignores_mention_config(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def fake_post(url, json, timeout):
+        captured["json"] = json
+        return Response()
+
+    monkeypatch.setattr("gemini_stock.notify.channels.requests.post", fake_post)
+
+    ok = send_feishu_text(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/token",
+        "分析一下$asts",
+        now_fn=lambda: datetime(2026, 1, 5, 4, 0, tzinfo=timezone.utc),
+        mention_open_id="ou_36013872f283455140c3f746097896df",
+        mention_name="交易分析",
+    )
+
+    assert ok is True
+    assert captured["json"]["msg_type"] == "interactive"
+    assert captured["json"]["card"]["header"]["title"]["content"] == "分析一下$asts"
+    assert captured["json"]["card"]["elements"][0]["content"] == "分析一下$asts"
 
 
 def test_send_feishu_interactive_card_posts_card_payload(monkeypatch):
@@ -147,11 +176,14 @@ def test_send_feishu_interactive_card_posts_card_payload(monkeypatch):
         "https://open.feishu.cn/open-apis/bot/v2/hook/token",
         {"header": {"title": {"content": "x"}}},
         now_fn=lambda: datetime(2026, 1, 5, 4, 0, tzinfo=timezone.utc),
+        mention_open_id="ou_36013872f283455140c3f746097896df",
+        mention_name="交易分析",
     )
 
     assert ok is True
     assert captured["json"]["msg_type"] == "interactive"
     assert "card" in captured["json"]
+    assert captured["json"]["card"] == {"header": {"title": {"content": "x"}}}
     assert captured["timeout"] == 10
 
 

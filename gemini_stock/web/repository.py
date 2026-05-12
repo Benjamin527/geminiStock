@@ -256,15 +256,31 @@ class DashboardRepository:
         for row in rows:
             payload = json.loads(row["payload_json"])
             signal = payload.get("signal", {})
+            alert_type = payload.get("type")
+            if alert_type == "movement_alert":
+                drop_pct = payload.get("drop_pct")
+                event_type = payload.get("event_type")
+                sign = "+" if event_type == "fast_rise" else "-"
+                sentiment_score = f"{sign}{float(drop_pct):.2f}%" if drop_pct is not None else None
+                bias = f"{payload.get('tier')}档" if payload.get("tier") is not None else None
+                setup_type = event_type or "movement_alert"
+                confidence = payload.get("repeat_count")
+            else:
+                sentiment_score = signal.get("sentiment_score")
+                bias = signal.get("bias")
+                setup_type = signal.get("setup_type")
+                confidence = signal.get("confidence")
+            category = _alert_category(alert_type, setup_type)
             alerts.append(
                 {
                     "symbol": row["symbol"],
                     "channel": row["channel"],
                     "created_at_utc": to_beijing_time(row["created_at_utc"]),
-                    "bias": signal.get("bias"),
-                    "sentiment_score": signal.get("sentiment_score"),
-                    "confidence": signal.get("confidence"),
-                    "setup_type": signal.get("setup_type"),
+                    "category": category,
+                    "bias": bias,
+                    "sentiment_score": sentiment_score,
+                    "confidence": confidence,
+                    "setup_type": setup_type,
                 }
             )
         return alerts
@@ -480,6 +496,18 @@ def _format_price_range(low: float | None, high: float | None) -> str:
     if low is None or high is None:
         return "-"
     return f"{low:.2f} - {high:.2f}"
+
+
+def _alert_category(alert_type: str | None, setup_type: str | None) -> str:
+    if alert_type in {"price_action", "price_action_p1", "price_action_p2"}:
+        return "到价提醒"
+    if alert_type == "movement_alert" or setup_type in {"fast_drop", "fast_rise", "movement_alert"}:
+        return "价格异动"
+    if alert_type == "benchmark_alert":
+        return "大盘观察"
+    if alert_type == "primary_alert":
+        return "AI 盯盘"
+    return "系统记录"
 
 
 def _expected_move(bias: str | None, close: float | None, support: float | None, resistance: float | None) -> str:

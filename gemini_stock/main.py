@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import datetime, time as dt_time, timezone
 
 import pandas as pd
 
-from gemini_stock.benchmarks import BenchmarkForecast, build_benchmark_forecast
+from gemini_stock.benchmarks import build_benchmark_forecast
 from gemini_stock.charts.renderer import ChartRenderer
 from gemini_stock.config import Settings, load_settings
 from gemini_stock.data.base import MarketDataError, NEW_YORK
@@ -19,7 +19,8 @@ from gemini_stock.features.snapshot import build_technical_snapshot
 from gemini_stock.llm.gemini_client import GeminiAnalysisError, GeminiAnalyzer, RuleBasedFallbackAnalyzer
 from gemini_stock.llm.openai_client import OpenAICompatibleAnalyzer
 from gemini_stock.logging_config import configure_logging
-from gemini_stock.news.base import NullNewsProvider
+from gemini_stock.market_calendar import latest_completed_trading_day
+from gemini_stock.news.base import NullNewsProvider, YFinanceNewsProvider
 from gemini_stock.notify.channels import (
     BEIJING,
     FeishuNotifier,
@@ -31,10 +32,10 @@ from gemini_stock.notify.channels import (
 )
 from gemini_stock.replay import build_daily_review, format_daily_review
 from gemini_stock.rules.alert_rules import AlertRuleEngine, BenchmarkAlertRuleEngine
+from gemini_stock.rules.movement_alerts import build_movement_alert_card, build_movement_alerts, format_movement_alert
 from gemini_stock.rules.price_action_alerts import build_price_action_alerts, build_price_action_card, format_price_action_alert
 from gemini_stock.schedule import MarketSession, get_schedule_decision
 from gemini_stock.storage.db import Database
-from gemini_stock.storage.mysql_sync import MySQLSync, MySQLSyncConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class RuntimeContext:
         )
         return cls(
             data_provider=data_provider,
-            news_provider=NullNewsProvider(),
+            news_provider=YFinanceNewsProvider() if settings.news_provider == "yfinance" else NullNewsProvider(),
             renderer=ChartRenderer(settings.chart_dir),
             analyzer=create_analyzer(settings),
             fallback_analyzer=RuleBasedFallbackAnalyzer(),
@@ -125,6 +126,11 @@ def run_symbol(
 
     snapshot = build_technical_snapshot(symbol, candles_15m)
     db.save_feature(snapshot)
+    trading_date = None
+    if not candles_1m.empty:
+        latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
+        trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
+        maybe_send_movement_alerts(settings, db, snapshot, candles_1m, profile=profile, trading_date=trading_date)
     existing_signal = db.get_successful_signal_for_snapshot(symbol, snapshot.timestamp_utc)
     if existing_signal is not None:
         logger.info("llm_analysis_skipped_same_snapshot", extra={"symbol": symbol, "snapshot_timestamp": snapshot.timestamp_utc.isoformat()})
@@ -197,9 +203,11 @@ def run_symbol(
         logger.info("alert_skipped", extra={"symbol": symbol, "reason": decision.reason})
         return result
 
-    latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
-    trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
-    event_key = build_decision_alert_event_key(decision, trading_date)
+    alert_trading_date = trading_date
+    if alert_trading_date is None:
+        latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
+        alert_trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
+    event_key = build_decision_alert_event_key(decision, alert_trading_date)
     payload = decision.json_dict()
     payload["event_key"] = event_key
     payload["type"] = "benchmark_alert" if isinstance(rules, BenchmarkAlertRuleEngine) else "primary_alert"
@@ -244,9 +252,55 @@ def run_once(settings: Settings) -> None:
             logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
         except Exception as exc:
             logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
+    run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
     maybe_send_premarket_brief(settings, db, benchmark_results)
     run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
-    maybe_sync_remote_mysql(settings, db)
+
+
+def run_movement_only_once(
+    settings: Settings,
+    db: Database | None = None,
+    context: RuntimeContext | None = None,
+    exclude_symbols: list[str] | None = None,
+) -> int:
+    if not settings.movement_alert_symbols:
+        return 0
+    database = db or Database(settings.database_path)
+    if db is None:
+        database.initialize()
+    runtime = context or RuntimeContext.from_settings(settings)
+    excluded = {symbol.upper() for symbol in (exclude_symbols or [])}
+    sent_count = 0
+    for symbol in settings.movement_alert_symbols:
+        normalized = symbol.upper()
+        if normalized in excluded:
+            continue
+        try:
+            sent_count += run_movement_only_symbol(normalized, settings, database, context=runtime)
+        except MarketDataError as exc:
+            logger.error("movement_market_data_failed", extra={"symbol": normalized, "error": str(exc)})
+        except Exception as exc:
+            logger.exception("movement_symbol_run_failed", extra={"symbol": normalized, "error": str(exc)})
+    return sent_count
+
+
+def run_movement_only_symbol(
+    symbol: str,
+    settings: Settings,
+    db: Database,
+    context: RuntimeContext,
+    trading_date: str | None = None,
+) -> int:
+    candles_1m = context.data_provider.get_ohlcv(symbol, "1m", settings.yfinance_period_1m)
+    db.save_candles(candles_from_frame(symbol, "1m", candles_1m))
+    return maybe_send_movement_alerts(
+        settings,
+        db,
+        symbol,
+        candles_1m,
+        profile="crypto",
+        trading_date=trading_date,
+    )
 
 
 def run_maintenance_tasks(
@@ -288,7 +342,10 @@ def maybe_send_premarket_brief(
         return
     text = format_premarket_brief(forecasts, trading_date=current.date().isoformat())
     try:
-        sent = send_feishu_text(settings.feishu_webhook_url, text)
+        sent = send_feishu_text(
+            settings.feishu_webhook_url,
+            text,
+        )
     except Exception as exc:
         logger.error("premarket_brief_failed", extra={"error": str(exc)})
         return
@@ -314,14 +371,18 @@ def maybe_send_daily_review(
     current = (now or datetime.now(BEIJING)).astimezone(BEIJING)
     if current.time() < dt_time(8, 0):
         return
-    trading_date = _previous_calendar_date(current.date())
+    trading_date = latest_completed_trading_day(current)
     event_key = f"daily_review:{trading_date.isoformat()}"
     if db.has_alert_event("feishu", event_key):
         return
     review = build_daily_review(db, review_symbols, trading_date)
     text = format_daily_review(review)
     try:
-        sent = send_feishu_text(settings.feishu_webhook_url, text, bypass_quiet_hours=True)
+        sent = send_feishu_text(
+            settings.feishu_webhook_url,
+            text,
+            bypass_quiet_hours=True,
+        )
     except Exception as exc:
         logger.error("daily_review_failed", extra={"error": str(exc), "trading_date": trading_date.isoformat()})
         return
@@ -377,7 +438,10 @@ def maybe_send_price_action_alerts(
                     bypass_quiet_hours=(alert.level == "P1"),
                 )
             else:
-                sent = send_feishu_text(settings.feishu_webhook_url, text)
+                sent = send_feishu_text(
+                    settings.feishu_webhook_url,
+                    text,
+                )
         except Exception as exc:
             logger.error("price_action_alert_failed", extra={"symbol": symbol, "event_key": alert.event_key, "error": str(exc)})
             continue
@@ -404,6 +468,64 @@ def maybe_send_price_action_alerts(
                 "feishu",
             )
             sent_count += 1
+    return sent_count
+
+
+def maybe_send_movement_alerts(
+    settings: Settings,
+    db: Database,
+    technical_snapshot,
+    candles_1m: pd.DataFrame,
+    profile: str,
+    trading_date: str | None = None,
+) -> int:
+    if candles_1m.empty:
+        return 0
+    latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
+    alert_date = trading_date or latest_timestamp.astimezone(NEW_YORK).date().isoformat()
+    alerts = build_movement_alerts(
+        technical_snapshot,
+        candles_1m,
+        profile=profile,
+        trading_date=alert_date,
+        threshold_pcts=db.get_movement_alert_threshold_settings(),
+    )
+    sent_count = 0
+    for alert in alerts:
+        text = format_movement_alert(alert)
+        for repeat_index in range(1, alert.repeat_count + 1):
+            event_key = f"{alert.event_key}:n{repeat_index}"
+            if db.has_alert_event("feishu", event_key):
+                continue
+            try:
+                sent = send_feishu_interactive_card(
+                    settings.feishu_webhook_url,
+                    build_movement_alert_card(alert),
+                )
+            except Exception as exc:
+                logger.error("movement_alert_failed", extra={"symbol": alert.symbol, "event_key": event_key, "error": str(exc)})
+                continue
+            if sent:
+                db.save_alert(
+                    alert.symbol,
+                    {
+                        "event_key": event_key,
+                        "type": "movement_alert",
+                        "symbol": alert.symbol,
+                        "profile": alert.profile,
+                        "event_type": alert.event_type,
+                        "tier": alert.tier,
+                        "repeat_index": repeat_index,
+                        "repeat_count": alert.repeat_count,
+                        "latest_price": alert.latest_price,
+                        "peak_price": alert.peak_price,
+                        "drop_pct": alert.drop_pct,
+                        "window_minutes": alert.window_minutes,
+                        "text": text,
+                    },
+                    "feishu",
+                )
+                sent_count += 1
     return sent_count
 
 
@@ -442,32 +564,6 @@ def _event_zone(values: list[float]) -> str:
     return f"{low:.2f}-{high:.2f}"
 
 
-def _previous_calendar_date(current: date) -> date:
-    return current - timedelta(days=1)
-
-
-def maybe_sync_remote_mysql(settings: Settings, db: Database) -> None:
-    if not settings.sync_remote_mysql:
-        return
-    if not all([settings.remote_mysql_host, settings.remote_mysql_user, settings.remote_mysql_password]):
-        logger.warning("remote_mysql_sync_skipped_missing_config")
-        return
-    syncer = MySQLSync(
-        MySQLSyncConfig(
-            host=settings.remote_mysql_host,
-            port=settings.remote_mysql_port,
-            user=settings.remote_mysql_user,
-            password=settings.remote_mysql_password,
-            database=settings.remote_mysql_database,
-        )
-    )
-    try:
-        inserted = syncer.sync_from_sqlite(db.path)
-        logger.info("remote_mysql_sync_completed", extra={"inserted": inserted, "database": settings.remote_mysql_database})
-    except Exception as exc:
-        logger.error("remote_mysql_sync_failed", extra={"error": str(exc), "database": settings.remote_mysql_database})
-
-
 def main() -> None:
     configure_logging()
     settings = load_settings()
@@ -487,6 +583,7 @@ def main() -> None:
             run_once(settings)
         else:
             logger.info("market_closed_skip_run", extra={"sleep_seconds": schedule.interval_seconds})
+            run_movement_only_once(settings)
             run_maintenance_tasks(settings)
         if settings.run_once:
             return

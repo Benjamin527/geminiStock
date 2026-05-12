@@ -27,6 +27,20 @@ def next_trading_day(value: datetime | date) -> date:
     return current
 
 
+def previous_trading_day(value: datetime | date) -> date:
+    current = _as_date(value) - timedelta(days=1)
+    while not is_trading_day(current):
+        current -= timedelta(days=1)
+    return current
+
+
+def latest_completed_trading_day(value: datetime) -> date:
+    current = value.astimezone(NEW_YORK)
+    if is_trading_day(current) and current.time() >= regular_close_time(current):
+        return current.date()
+    return previous_trading_day(current)
+
+
 def market_holidays(year: int) -> set[date]:
     thanksgiving = _nth_weekday(year, 11, 3, 4)
     return {

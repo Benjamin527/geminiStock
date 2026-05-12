@@ -74,14 +74,15 @@ def test_price_action_alert_triggers_bullish_take_profit_zone():
     assert "动作：分批止盈，保留计划" in text
 
 
-def test_price_action_alert_skips_non_alert_signals():
+def test_price_action_alert_still_tracks_actionable_non_alert_signals():
     alerts = build_price_action_alerts(
         _signal(should_alert=False),
         _one_minute_frame(12.15),
         trading_date="2026-01-05",
     )
 
-    assert alerts == []
+    assert len(alerts) == 1
+    assert alerts[0].action == "buy"
 
 
 def test_price_action_alert_skips_non_actionable_tight_targets():

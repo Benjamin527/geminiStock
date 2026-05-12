@@ -126,7 +126,14 @@ def format_premarket_brief(forecasts: list[BenchmarkForecast], trading_date: str
     return "\n".join(lines)
 
 
-def send_feishu_text(webhook_url: str | None, text: str, now_fn=None, bypass_quiet_hours: bool = False) -> bool:
+def send_feishu_text(
+    webhook_url: str | None,
+    text: str,
+    now_fn=None,
+    bypass_quiet_hours: bool = False,
+    mention_open_id: str | None = None,
+    mention_name: str = "",
+) -> bool:
     if not webhook_url:
         logger.info("feishu_not_configured")
         return False
@@ -137,7 +144,7 @@ def send_feishu_text(webhook_url: str | None, text: str, now_fn=None, bypass_qui
         return False
     response = requests.post(
         webhook_url,
-        json={"msg_type": "text", "content": {"text": text}},
+        json={"msg_type": "interactive", "card": _build_text_card(text)},
         timeout=10,
     )
     response.raise_for_status()
@@ -149,6 +156,8 @@ def send_feishu_interactive_card(
     card: dict,
     now_fn=None,
     bypass_quiet_hours: bool = False,
+    mention_open_id: str | None = None,
+    mention_name: str = "",
 ) -> bool:
     if not webhook_url:
         logger.info("feishu_not_configured")
@@ -190,12 +199,26 @@ class TelegramNotifier:
 class FeishuNotifier:
     channel = "feishu"
 
-    def __init__(self, webhook_url: str | None, now_fn=None) -> None:
+    def __init__(
+        self,
+        webhook_url: str | None,
+        now_fn=None,
+        mention_open_id: str | None = None,
+        mention_name: str = "",
+    ) -> None:
         self.webhook_url = webhook_url
         self.now_fn = now_fn or (lambda: datetime.now(BEIJING))
+        self.mention_open_id = mention_open_id
+        self.mention_name = mention_name
 
     def send(self, decision: AlertDecision) -> bool:
-        return send_feishu_text(self.webhook_url, format_alert(decision), now_fn=self.now_fn)
+        return send_feishu_text(
+            self.webhook_url,
+            format_alert(decision),
+            now_fn=self.now_fn,
+            mention_open_id=self.mention_open_id,
+            mention_name=self.mention_name,
+        )
 
 
 class WeComNotifier:
@@ -223,3 +246,21 @@ def _fmt_or_dash(value: float | None) -> str:
 
 def _fmt_one_or_dash(value: float | None) -> str:
     return f"{value:.1f}" if value is not None else "-"
+
+
+def _build_text_card(text: str) -> dict:
+    lines = [line for line in text.splitlines() if line.strip()]
+    title = lines[0][:80] if lines else "盯盘提醒"
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": text,
+            }
+        ],
+    }

@@ -8,9 +8,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from gemini_stock.config import load_settings
+from gemini_stock.rules.movement_alerts import DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
 from gemini_stock.rules.trade_plan import has_actionable_trade_levels
 from gemini_stock.storage.db import Database
-from gemini_stock.web.mysql_repository import MySQLDashboardRepository
 from gemini_stock.web.repository import DashboardRepository, utc_now_iso
 
 
@@ -26,10 +26,9 @@ def create_app(
     app = FastAPI(title="Gemini Stock Dashboard")
     charts.mkdir(parents=True, exist_ok=True)
     app.mount("/charts", StaticFiles(directory=charts), name="charts")
-    repo = MySQLDashboardRepository(settings, charts) if settings.dashboard_data_source == "mysql" else DashboardRepository(db_path, charts)
-    db = Database(db_path) if settings.dashboard_data_source != "mysql" else None
-    if db is not None:
-        db.initialize()
+    repo = DashboardRepository(db_path, charts)
+    db = Database(db_path)
+    db.initialize()
 
     def selected_symbols() -> list[str]:
         if symbols is not None:
@@ -55,6 +54,15 @@ def create_app(
             "benchmark": selected_benchmarks(),
         }
 
+    def movement_alert_settings_payload() -> dict:
+        thresholds = db.get_movement_alert_threshold_settings()
+        return {
+            "threshold_pcts": thresholds["fast_drop"],
+            "fast_drop": thresholds["fast_drop"],
+            "fast_rise": thresholds["fast_rise"],
+            "configurable": True,
+        }
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         symbols_now = selected_symbols()
@@ -65,9 +73,10 @@ def create_app(
             symbols=repo.get_symbol_states(symbols_now),
             benchmarks=repo.get_benchmark_states(benchmarks_now),
             llm_outputs=repo.get_recent_llm_outputs(symbols_now),
-            alerts=repo.get_recent_alerts(symbols_now),
+            alerts=repo.get_recent_alerts(symbols_now + benchmarks_now),
             errors=repo.get_recent_errors(symbols_now),
             watchlist=watchlist_payload(),
+            movement_alert_settings=movement_alert_settings_payload(),
         )
 
     @app.get("/api/status")
@@ -81,9 +90,10 @@ def create_app(
             "symbols": repo.get_symbol_states(symbols_now),
             "benchmarks": repo.get_benchmark_states(benchmarks_now),
             "recent_llm_outputs": repo.get_recent_llm_outputs(symbols_now),
-            "recent_alerts": repo.get_recent_alerts(symbols_now),
+            "recent_alerts": repo.get_recent_alerts(symbols_now + benchmarks_now),
             "recent_errors": repo.get_recent_errors(symbols_now),
             "watchlist": watchlist_payload(),
+            "movement_alert_settings": movement_alert_settings_payload(),
         }
 
     @app.get("/api/health")
@@ -103,10 +113,34 @@ def create_app(
             "configurable": db is not None,
         }
 
+    @app.get("/api/movement-alert-settings")
+    def api_movement_alert_settings() -> dict:
+        return movement_alert_settings_payload()
+
+    @app.post("/api/movement-alert-settings")
+    def api_update_movement_alert_settings(payload: dict) -> dict:
+        raw_thresholds = (
+            {"fast_drop": payload.get("fast_drop"), "fast_rise": payload.get("fast_rise")}
+            if "fast_drop" in payload or "fast_rise" in payload
+            else payload.get("threshold_pcts")
+        )
+        if not isinstance(raw_thresholds, (list, dict)):
+            raise HTTPException(status_code=422, detail="movement thresholds must be a list or split threshold object")
+        try:
+            thresholds = db.save_movement_alert_thresholds(raw_thresholds)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        settings = db.get_movement_alert_threshold_settings()
+        return {
+            "ok": True,
+            "threshold_pcts": settings["fast_drop"],
+            "fast_drop": settings["fast_drop"],
+            "fast_rise": settings["fast_rise"],
+            "configurable": True,
+        }
+
     @app.post("/api/watchlist")
     def api_add_watch_symbol(payload: dict) -> dict:
-        if db is None:
-            raise HTTPException(status_code=400, detail="watchlist editing is unavailable when dashboard uses mysql mode")
         symbol = str(payload.get("symbol") or "").upper().strip()
         if not re.fullmatch(r"[A-Z0-9._-]{1,10}", symbol):
             raise HTTPException(status_code=422, detail="symbol must be 1-10 chars and only contain A-Z, 0-9, dot, underscore, or hyphen")
@@ -149,6 +183,9 @@ def _label(value: str | None) -> str:
         "breakout": "突破",
         "breakdown": "跌破",
         "no_trade": "观望",
+        "movement_alert": "价格异动",
+        "fast_drop": "快跌异动",
+        "fast_rise": "快涨异动",
         "confirmed": "确认",
         "rejected": "拒绝",
         "not_applicable": "不适用",
@@ -198,6 +235,55 @@ def _action_label(bias: str | None) -> str:
     return "观望等待"
 
 
+def _symbol_sort_key(item: dict) -> tuple[int, str]:
+    action = _symbol_action_state(
+        item,
+        has_actionable_trade_levels(
+            setup_type=item.get("setup_type"),
+            entry_zone=item.get("entry_zone"),
+            stop_loss=item.get("stop_loss"),
+            take_profit=item.get("take_profit"),
+            risk_reward_ratio=item.get("risk_reward_ratio"),
+        ),
+    )
+    score = int(action["rank"])
+    sentiment = item.get("sentiment_score")
+    if isinstance(sentiment, (int, float)):
+        score += min(int(abs(sentiment) * 2), 20)
+    return (-score, str(item.get("symbol") or ""))
+
+
+def _symbol_action_state(item: dict, actionable_plan: bool) -> dict:
+    freshness = (item.get("data_freshness") or {}).get("state")
+    bias = item.get("bias") or "neutral"
+    if item.get("should_alert"):
+        return {"label": "优先处理", "message": "AI 已触发提醒，先核对失效位和仓位", "tone": "urgent", "bias": bias, "rank": 100}
+    if freshness in {"stale", "no_data"}:
+        return {"label": "暂停判断", "message": "数据过期，暂停交易判断", "tone": "watch", "bias": "neutral", "rank": 10}
+    if item.get("last_error"):
+        return {"label": "检查错误", "message": "最近分析有异常，先看错误记录", "tone": "watch", "bias": "neutral", "rank": 15}
+
+    price = item.get("latest_1m_price") or item.get("regular_market_price") or item.get("last_price")
+    if actionable_plan and _price_in_zone(price, item.get("entry_zone")):
+        if bias == "bearish":
+            return {"label": "减风险", "message": "价格进入卖出参考区，先减风险", "tone": "urgent", "bias": bias, "rank": 92}
+        return {"label": "到买入区", "message": "价格进入买入参考区，分批试探", "tone": "ready", "bias": bias, "rank": 92}
+    if actionable_plan and _price_in_zone(price, item.get("take_profit")):
+        if bias == "bearish":
+            return {"label": "回补区", "message": "价格进入回补区，避免继续追空", "tone": "ready", "bias": bias, "rank": 88}
+        return {"label": "止盈区", "message": "价格进入止盈参考区，按计划分批处理", "tone": "ready", "bias": bias, "rank": 88}
+    if actionable_plan:
+        return {"label": _action_label(bias), "message": _action_hint(bias), "tone": "watch", "bias": bias, "rank": 60}
+    return {"label": "观察", "message": "当前不可执行，仅观察", "tone": "watch", "bias": "neutral", "rank": 30}
+
+
+def _price_in_zone(price, zone) -> bool:
+    if price is None or not zone or len(zone) < 2:
+        return False
+    low, high = sorted(float(value) for value in zone[:2])
+    return low <= float(price) <= high
+
+
 def render_dashboard(
     status: dict,
     metrics: dict,
@@ -207,8 +293,10 @@ def render_dashboard(
     alerts: list[dict],
     errors: list[dict],
     watchlist: dict[str, list[str]],
+    movement_alert_settings: dict,
 ) -> str:
-    symbol_cards = "\n".join(_render_symbol_card(item) for item in symbols)
+    ordered_symbols = sorted(symbols, key=_symbol_sort_key)
+    symbol_cards = "\n".join(_render_symbol_card(item) for item in ordered_symbols)
     benchmark_cards = "\n".join(_render_benchmark_card(item) for item in benchmarks)
     llm_mobile_cards = "\n".join(_render_llm_mobile_card(row) for row in llm_outputs[:8]) or "<div class='feed-card muted-row'>暂无 AI 分析记录</div>"
     alert_mobile_cards = "\n".join(_render_alert_mobile_card(row) for row in alerts[:8]) or "<div class='feed-card muted-row'>暂无报警记录</div>"
@@ -246,18 +334,21 @@ def render_dashboard(
     alert_rows = "\n".join(
         f"""
         <tr>
-          <td>{row['created_at_utc']}</td><td>{row['symbol']}</td><td>{row['channel']}</td>
+          <td>{row['created_at_utc']}</td><td><span class="feed-type">{row.get('category', '系统记录')}</span></td><td>{row['symbol']}</td><td>{row['channel']}</td>
           <td>{_label(row['bias'])}</td><td>{_fmt(row['sentiment_score'])}</td><td>{_fmt(row['confidence'])}</td>
         </tr>
         """
         for row in alerts
-    ) or "<tr><td colspan='6'>暂无报警记录</td></tr>"
+    ) or "<tr><td colspan='7'>暂无报警记录</td></tr>"
     error_items = "\n".join(
         f"<li><b>{row['symbol']}</b><span>{row['created_at_utc']} · {_label(row['analysis_level'])}</span><p>{row['error']}</p></li>"
         for row in errors
     ) or "<li class='muted-row'>暂无近期错误</li>"
     monitored_primary = " · ".join(watchlist.get("primary") or [])
     monitored_benchmark = " · ".join(watchlist.get("benchmark") or [])
+    drop_thresholds = movement_alert_settings.get("fast_drop") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
+    rise_thresholds = movement_alert_settings.get("fast_rise") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
+    countdown_seconds = int(status.get("countdown_seconds") or 0)
     return f"""
 <!doctype html>
 <html lang="zh-CN">
@@ -308,7 +399,31 @@ def render_dashboard(
       cursor: pointer;
     }}
     .watch-btn:hover {{ filter: brightness(1.08); }}
+    details.settings-drawer {{ padding: 0; overflow: hidden; }}
+    details.settings-drawer > summary {{
+      list-style: none; cursor: pointer; padding: 15px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      color: var(--ink); font-weight: 700;
+    }}
+    details.settings-drawer > summary::-webkit-details-marker {{ display: none; }}
+    details.settings-drawer > summary::after {{ content: "展开"; color: var(--muted); font-size: 12px; font-weight: 600; }}
+    details.settings-drawer[open] > summary::after {{ content: "收起"; }}
+    .settings-body {{ display: grid; gap: 14px; padding: 0 14px 14px; }}
+    .movement-settings {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }}
+    .threshold-matrix {{ display: grid; grid-template-columns: 90px repeat(3, minmax(110px, 1fr)); gap: 10px; align-items: end; }}
+    .threshold-label {{ color: var(--muted); font-weight: 700; padding-bottom: 10px; }}
+    .tier-grid {{ display: grid; grid-template-columns: repeat(3, minmax(110px, 1fr)); gap: 10px; }}
+    .tier-field {{ display: grid; gap: 5px; }}
+    .tier-field label {{ color: var(--muted); font-size: 12px; }}
+    .tier-input {{
+      height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #0d1722;
+      color: var(--ink);
+      padding: 0 10px;
+    }}
     main {{ padding: 24px 32px 40px; display: grid; gap: 18px; }}
+    .top-deck {{ position: sticky; top: 0; z-index: 20; background: rgba(15,20,26,.92); backdrop-filter: blur(16px); }}
     .status {{ display: grid; grid-template-columns: 1.2fr 1fr 1fr 1.4fr; gap: 12px; }}
     .metric, section, .card, .stat, .cost-panel, .errors {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 10px 30px rgba(4,9,14,.2); }}
     .metric.primary {{ background: var(--dark); color: #f6f8f4; border-color: var(--line); }}
@@ -326,6 +441,9 @@ def render_dashboard(
     .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }}
     .benchmark-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
     .mobile-feed {{ display: none; gap: 10px; }}
+    .mobile-tabs {{ display: none; position: sticky; top: 0; z-index: 30; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(10,16,22,.94); backdrop-filter: blur(14px); grid-template-columns: repeat(4, 1fr); gap: 6px; }}
+    .mobile-tab {{ min-height: 36px; border: 1px solid var(--line); border-radius: 7px; background: #111b26; color: var(--muted); font-weight: 700; }}
+    .mobile-tab.active {{ color: var(--ink); border-color: rgba(27,193,143,.45); background: rgba(27,193,143,.12); }}
     .card {{ background:
         radial-gradient(circle at top right, rgba(102,183,255,.12), transparent 28%),
         linear-gradient(180deg, #18222e, #141d28); }}
@@ -371,6 +489,9 @@ def render_dashboard(
     .action-tag.bullish {{ color: var(--green); border-color: rgba(13,119,86,.25); background: rgba(13,119,86,.08); }}
     .action-tag.bearish {{ color: var(--red); border-color: rgba(182,61,50,.25); background: rgba(182,61,50,.08); }}
     .action-tag.neutral {{ color: var(--blue); border-color: rgba(36,92,131,.25); background: rgba(36,92,131,.08); }}
+    .action-banner.urgent {{ border-color: rgba(239,111,122,.45); background: rgba(239,111,122,.10); }}
+    .action-banner.ready {{ border-color: rgba(27,193,143,.45); background: rgba(27,193,143,.10); }}
+    .action-banner.watch {{ border-color: rgba(245,185,76,.42); background: rgba(245,185,76,.08); }}
     .trade-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }}
     .trade-box {{ padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #12202e; min-width: 0; }}
     .trade-box span {{ display: block; color: var(--muted); font-size: 12px; }}
@@ -404,6 +525,7 @@ def render_dashboard(
     .feed-top {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }}
     .feed-top b {{ font-size: 15px; }}
     .feed-meta {{ color: var(--muted); font-size: 12px; }}
+    .feed-type {{ display: inline-flex; width: fit-content; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 12px; }}
     .errors ul {{ list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }}
     .errors li {{ border-top: 1px solid var(--line); padding-top: 10px; }}
     .errors li:first-child {{ border-top: 0; padding-top: 0; }}
@@ -415,10 +537,16 @@ def render_dashboard(
       .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .watch-panel {{ grid-template-columns: 1fr; }}
       .watch-form {{ justify-content: flex-start; }}
+      .movement-settings {{ grid-template-columns: 1fr; }}
       header, main {{ padding-left: 16px; padding-right: 16px; }}
       table {{ display: block; overflow-x: auto; white-space: nowrap; }}
     }}
     @media (max-width: 680px) {{
+      .mobile-tabs {{ display: grid; }}
+      [data-panel] {{ display: none; }}
+      [data-panel].active-panel {{ display: block; }}
+      .top-deck.active-panel {{ display: block; }}
+      .overview.active-panel, .split.active-panel {{ display: grid; }}
       .desktop-table {{ display: none; }}
       .mobile-feed {{ display: grid; }}
       .benchmark-cards {{ grid-template-columns: 1fr; }}
@@ -431,6 +559,9 @@ def render_dashboard(
       .trade-strip {{ grid-template-columns: 1fr; }}
       .grid {{ grid-template-columns: 1fr 1fr; }}
       .stats {{ grid-template-columns: 1fr 1fr; }}
+      .tier-grid {{ grid-template-columns: 1fr; }}
+      .threshold-matrix {{ grid-template-columns: 1fr; }}
+      .threshold-label {{ padding-bottom: 0; }}
       .metric, section, .card, .stat, .cost-panel, .errors {{ padding: 12px; }}
       .benchmark-grid {{ grid-template-columns: 1fr; }}
     }}
@@ -442,36 +573,86 @@ def render_dashboard(
     <div class="sub">只读监控页面，不提供交易和下单操作。页面每 30 秒自动刷新。</div>
   </header>
   <main>
-    <div class="status">
-      <div class="metric primary"><span>距离下次执行</span><b>{status['countdown_label']}</b></div>
-      <div class="metric"><span>市场阶段</span><b>{_label(status['market_session'])}</b></div>
-      <div class="metric"><span>当前是否执行</span><b>{'是' if status['should_run_now'] else '否'}</b></div>
-      <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
-    </div>
-    <div class="sub">{'配置提醒：本地 .env 含敏感字段 ' + warning_text + '，建议轮换并移入密钥管理。' if warning_text else ''}</div>
-    <section>
-      <h2>监控列表</h2>
-      <div class="watch-panel">
-        <div class="watch-meta">
-          <div class="sub">主监控：{monitored_primary or '-'}</div>
-          <div class="sub">参考监控：{monitored_benchmark or '-'}</div>
-          <div class="watch-badges">{''.join(f"<span class='watch-badge'>{symbol}</span>" for symbol in watchlist.get('primary', [])) or "<span class='watch-badge'>暂无</span>"}</div>
-        </div>
-        <form class="watch-form" id="watch-form">
-          <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
-          <button class="watch-btn" type="submit">加入监控</button>
-        </form>
+    <nav class="mobile-tabs" aria-label="Dashboard sections">
+      <button class="mobile-tab active" type="button" data-tab-target="main">主观察</button>
+      <button class="mobile-tab" type="button" data-tab-target="market">大盘</button>
+      <button class="mobile-tab" type="button" data-tab-target="activity">告警</button>
+      <button class="mobile-tab" type="button" data-tab-target="settings">设置</button>
+    </nav>
+    <section class="top-deck active-panel" data-panel="main">
+      <div class="status">
+        <div class="metric primary"><span>距离下次执行</span><b id="next-run-countdown" data-seconds="{countdown_seconds}">{status['countdown_label']}</b></div>
+        <div class="metric"><span>市场阶段</span><b>{_label(status['market_session'])}</b></div>
+        <div class="metric"><span>今日报警 / 错误</span><b>{metrics['alerts_today']} / {metrics['llm_errors_today']}</b></div>
+        <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
       </div>
     </section>
-    <section>
+    <div class="sub">{'配置提醒：本地 .env 含敏感字段 ' + warning_text + '，建议轮换并移入密钥管理。' if warning_text else ''}</div>
+    <details class="settings-drawer" data-panel="settings">
+      <summary>监控与阈值设置</summary>
+      <div class="settings-body">
+        <section>
+          <h2>监控列表</h2>
+          <div class="watch-panel">
+            <div class="watch-meta">
+              <div class="sub">主监控：{monitored_primary or '-'}</div>
+              <div class="sub">参考监控：{monitored_benchmark or '-'}</div>
+              <div class="watch-badges">{''.join(f"<span class='watch-badge'>{symbol}</span>" for symbol in watchlist.get('primary', [])) or "<span class='watch-badge'>暂无</span>"}</div>
+            </div>
+            <form class="watch-form" id="watch-form">
+              <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
+              <button class="watch-btn" type="submit">加入监控</button>
+            </form>
+          </div>
+        </section>
+        <section>
+          <h2>价格异动阈值</h2>
+          <div class="movement-settings">
+            <div>
+              <div class="sub">快跌和快涨分别设置三档；1档推送 1 次，2档推送 2 次，3档推送 3 次。</div>
+              <form class="threshold-matrix" id="movement-settings-form">
+                <div class="threshold-label">下跌</div>
+                <div class="tier-field">
+                  <label for="drop-tier1-pct">下跌 1档 %</label>
+                  <input class="tier-input" id="drop-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[0]}" required>
+                </div>
+                <div class="tier-field">
+                  <label for="drop-tier2-pct">下跌 2档 %</label>
+                  <input class="tier-input" id="drop-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[1]}" required>
+                </div>
+                <div class="tier-field">
+                  <label for="drop-tier3-pct">下跌 3档 %</label>
+                  <input class="tier-input" id="drop-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[2]}" required>
+                </div>
+                <div class="threshold-label">上涨</div>
+                <div class="tier-field">
+                  <label for="rise-tier1-pct">上涨 1档 %</label>
+                  <input class="tier-input" id="rise-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[0]}" required>
+                </div>
+                <div class="tier-field">
+                  <label for="rise-tier2-pct">上涨 2档 %</label>
+                  <input class="tier-input" id="rise-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[1]}" required>
+                </div>
+                <div class="tier-field">
+                  <label for="rise-tier3-pct">上涨 3档 %</label>
+                  <input class="tier-input" id="rise-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[2]}" required>
+                </div>
+              </form>
+            </div>
+            <button class="watch-btn" type="submit" form="movement-settings-form">保存阈值</button>
+          </div>
+        </section>
+      </div>
+    </details>
+    <section class="active-panel" data-panel="main">
       <h2>主观察</h2>
       <div class="cards">{symbol_cards}</div>
     </section>
-    <section>
+    <section data-panel="market">
       <h2>大盘观察</h2>
       <div class="benchmark-cards">{benchmark_cards}</div>
     </section>
-    <div class="overview">
+    <div class="overview" data-panel="activity">
       <section>
         <h2>今日运行概览</h2>
         <div class="stats">{metric_cards}</div>
@@ -483,7 +664,7 @@ def render_dashboard(
         <p class="sub">日常扫描优先 JSON，强候选才进入图像复核。</p>
       </div>
     </div>
-    <div class="split">
+    <div class="split" data-panel="activity">
       <section>
         <h2>最近执行时间线</h2>
         <table class="desktop-table"><thead><tr><th>时间</th><th>标的</th><th>级别</th><th>传图</th><th>方向</th><th>分数</th><th>置信度</th><th>视觉复核</th><th>错误</th></tr></thead><tbody>{llm_rows}</tbody></table>
@@ -494,13 +675,35 @@ def render_dashboard(
         <ul>{error_items}</ul>
       </aside>
     </div>
-    <section>
+    <section data-panel="activity">
       <h2>最近报警</h2>
-      <table class="desktop-table"><thead><tr><th>时间</th><th>标的</th><th>渠道</th><th>方向</th><th>分数</th><th>置信度</th></tr></thead><tbody>{alert_rows}</tbody></table>
+      <table class="desktop-table"><thead><tr><th>时间</th><th>类型</th><th>标的</th><th>渠道</th><th>方向</th><th>分数</th><th>置信度</th></tr></thead><tbody>{alert_rows}</tbody></table>
       <div class="mobile-feed">{alert_mobile_cards}</div>
     </section>
   </main>
   <script>
+    const countdownEl = document.getElementById("next-run-countdown");
+    if (countdownEl) {{
+      let remainingSeconds = Number.parseInt(countdownEl.dataset.seconds || "0", 10);
+      const formatCountdown = (seconds) => {{
+        if (!Number.isFinite(seconds) || seconds <= 0) {{
+          return "即将执行";
+        }}
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        if (h > 0) {{
+          return `${{h}}时${{m}}分${{s}}秒`;
+        }}
+        return `${{m}}分${{s}}秒`;
+      }};
+      countdownEl.textContent = formatCountdown(remainingSeconds);
+      setInterval(() => {{
+        remainingSeconds = Math.max(remainingSeconds - 1, 0);
+        countdownEl.textContent = formatCountdown(remainingSeconds);
+      }}, 1000);
+    }}
+
     const watchForm = document.getElementById("watch-form");
     if (watchForm) {{
       watchForm.addEventListener("submit", async (event) => {{
@@ -526,6 +729,43 @@ def render_dashboard(
         }}
       }});
     }}
+
+    const movementSettingsForm = document.getElementById("movement-settings-form");
+    if (movementSettingsForm) {{
+      movementSettingsForm.addEventListener("submit", async (event) => {{
+        event.preventDefault();
+        const readThresholds = (prefix) => [1, 2, 3].map((tier) => Number.parseFloat(document.getElementById(`${{prefix}}-tier${{tier}}-pct`).value));
+        const fast_drop = readThresholds("drop");
+        const fast_rise = readThresholds("rise");
+        try {{
+          const response = await fetch("/api/movement-alert-settings", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ fast_drop, fast_rise }}),
+          }});
+          if (!response.ok) {{
+            const data = await response.json().catch(() => ({{}}));
+            alert(data.detail || "保存失败，请检查三档阈值是否递增");
+            return;
+          }}
+          location.reload();
+        }} catch (_) {{
+          alert("网络异常，稍后再试");
+        }}
+      }});
+    }}
+
+    const tabs = Array.from(document.querySelectorAll(".mobile-tab"));
+    const panels = Array.from(document.querySelectorAll("[data-panel]"));
+    const activateTab = (target) => {{
+      tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tabTarget === target));
+      panels.forEach((panel) => panel.classList.toggle("active-panel", panel.dataset.panel === target));
+      if (target === "settings") {{
+        const drawer = document.querySelector(".settings-drawer");
+        if (drawer) drawer.open = true;
+      }}
+    }};
+    tabs.forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tabTarget)));
   </script>
 </body>
 </html>
@@ -551,10 +791,9 @@ def _render_symbol_card(item: dict) -> str:
     target_value = _fmt_price_band(item["take_profit"], item["bias"])
     trade_box_class = "trade-box" if actionable_plan else "trade-box muted"
     plan_note = "" if actionable_plan else "<div class='plan-note'>当前不可执行，仅观察</div>"
-    action_label = _action_label(item["bias"])
-    action_hint = _action_hint(item["bias"])
+    action = _symbol_action_state(item, actionable_plan)
     return f"""
-    <article class="card">
+    <article class="card" data-symbol="{item['symbol']}">
       <div class="card-head">
         <div class="headline">
           <div class="symbol">{item['symbol']}</div>
@@ -562,6 +801,7 @@ def _render_symbol_card(item: dict) -> str:
             <span class="pill bias-{bias}">{_label(item['bias'])}</span>
             <span class="pill">{_label(item['setup_type'])}</span>
             <span class="pill">{_label(item['analysis_level'])}</span>
+            <span class="pill">{_action_label(item['bias'])}</span>
           </div>
         </div>
         <div class="score-wrap">
@@ -569,12 +809,12 @@ def _render_symbol_card(item: dict) -> str:
           <div class="confidence">置信度 {_fmt(item['confidence'])}</div>
         </div>
       </div>
-      <div class="action-banner">
+      <div class="action-banner {action['tone']}">
         <div class="action-copy">
-          <span>建议动作</span>
-          <b>{action_hint}</b>
+          <span>当前动作 / 建议动作</span>
+          <b>{action['message']}</b>
         </div>
-        <div class="action-tag {bias}">{action_label}</div>
+        <div class="action-tag {action['bias']}">{action['label']}</div>
       </div>
       <div class="trade-strip">
         <div class="{trade_box_class}"><span>{entry_label}</span><b>{entry_value}</b></div>
@@ -670,7 +910,7 @@ def _render_alert_mobile_card(row: dict) -> str:
         </div>
         <span class="pill bias-{row['bias'] or 'neutral'}">{_label(row['bias'])}</span>
       </div>
-      <div class="feed-meta">{row['channel']} · {_label(row['setup_type'])}</div>
+      <div class="feed-meta"><span class="feed-type">{row.get('category', '系统记录')}</span> · {row['channel']} · {_label(row['setup_type'])}</div>
       <div>分数 {_fmt(row['sentiment_score'])} · 置信度 {_fmt(row['confidence'])}</div>
     </div>
     """

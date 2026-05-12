@@ -6,6 +6,8 @@ from html import unescape
 import re
 from typing import Iterable
 
+import yfinance as yf
+
 from gemini_stock.schemas import NewsItem
 
 
@@ -18,6 +20,66 @@ class NewsProvider(ABC):
 class NullNewsProvider(NewsProvider):
     def get_news(self, symbols: list[str]) -> list[NewsItem]:
         return []
+
+
+class YFinanceNewsProvider(NewsProvider):
+    def get_news(self, symbols: list[str]) -> list[NewsItem]:
+        raw_items = []
+        for symbol in symbols:
+            try:
+                raw_items.extend(_extract_yfinance_news_items(yf.Ticker(symbol).news, symbol))
+            except Exception:
+                continue
+        return normalize_news_items(raw_items, symbols)
+
+
+def _extract_yfinance_news_items(items: Iterable[dict], symbol: str) -> list[dict]:
+    extracted = []
+    for item in items or []:
+        content = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = str(content.get("title") or "").strip()
+        if not title:
+            continue
+        url = _news_url(content)
+        if not url:
+            continue
+        extracted.append(
+            {
+                "title": title,
+                "source": _news_source(content),
+                "published_at": _news_timestamp(content),
+                "summary": content.get("summary") or content.get("description") or "",
+                "url": url,
+                "symbols": [symbol],
+            }
+        )
+    return extracted
+
+
+def _news_url(content: dict) -> str:
+    canonical = content.get("canonicalUrl")
+    if isinstance(canonical, dict) and canonical.get("url"):
+        return str(canonical["url"])
+    click_through = content.get("clickThroughUrl")
+    if isinstance(click_through, dict) and click_through.get("url"):
+        return str(click_through["url"])
+    return str(content.get("link") or content.get("url") or "").strip()
+
+
+def _news_source(content: dict) -> str:
+    provider = content.get("provider")
+    if isinstance(provider, dict):
+        return str(provider.get("displayName") or provider.get("name") or "Yahoo Finance")
+    return str(content.get("publisher") or "Yahoo Finance")
+
+
+def _news_timestamp(content: dict) -> datetime:
+    raw = content.get("pubDate") or content.get("displayTime") or content.get("providerPublishTime")
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    if isinstance(raw, str) and raw:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def clean_summary(value: str) -> str:
@@ -46,7 +108,12 @@ def normalize_news_items(raw_items: Iterable[dict], symbols: list[str]) -> list[
         if isinstance(published_at, str):
             published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
         summary = clean_summary(str(item.get("summary", "")))
-        related = [symbol for symbol in symbols if symbol.upper() in f"{title} {summary}".upper()]
+        explicit_symbols = [str(symbol).upper() for symbol in item.get("symbols", [])]
+        related = [
+            symbol
+            for symbol in symbols
+            if symbol.upper() in explicit_symbols or symbol.upper() in f"{title} {summary}".upper()
+        ]
         normalized.append(
             NewsItem(
                 title=title,

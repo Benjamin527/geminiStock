@@ -27,8 +27,7 @@ def build_price_action_alerts(
     trading_date: str,
 ) -> list[PriceActionAlert]:
     if (
-        not signal.should_alert
-        or signal.visual_confirmation == "rejected"
+        signal.visual_confirmation == "rejected"
         or candles_1m.empty
         or not has_actionable_trade_plan(signal)
     ):

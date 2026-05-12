@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,8 +12,9 @@ class Settings(BaseSettings):
 
     symbols: list[str] = Field(default_factory=lambda: ["CONL", "TSLL"])
     benchmark_symbols: list[str] = Field(default_factory=lambda: ["SPY", "QQQ"])
+    movement_alert_symbols: list[str] = Field(default_factory=lambda: ["BTC-USD"])
     data_provider: Literal["auto", "yfinance", "polygon"] = "yfinance"
-    news_provider: Literal["none"] = "none"
+    news_provider: Literal["none", "yfinance"] = "none"
 
     llm_provider: Literal["auto", "gemini", "openai", "fallback"] = "auto"
     gemini_api_key: str | None = None
@@ -27,7 +28,7 @@ class Settings(BaseSettings):
     chart_dir: Path = Path("charts")
     poll_interval_minutes: int = 15
     alert_cooldown_minutes: int = 60
-    dashboard_data_source: Literal["sqlite", "mysql"] = "sqlite"
+    dashboard_data_source: str = "sqlite"
     positions: dict[str, float] = Field(default_factory=dict)
     average_costs: dict[str, float] = Field(default_factory=dict)
 
@@ -45,14 +46,12 @@ class Settings(BaseSettings):
     worker_stale_after_intervals: float = 2.5
     max_scheduler_sleep_seconds: int = 300
 
-    sync_remote_mysql: bool = False
-    remote_mysql_host: str | None = None
-    remote_mysql_port: int = 3306
-    remote_mysql_user: str | None = None
-    remote_mysql_password: str | None = None
-    remote_mysql_database: str = "gemini_stock"
-
     run_once: bool = False
+
+    @field_validator("dashboard_data_source", mode="before")
+    @classmethod
+    def sqlite_only_dashboard_source(cls, value: object) -> str:
+        return "sqlite"
 
 
 def load_settings() -> Settings:

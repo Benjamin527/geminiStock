@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from gemini_stock.schemas import Candle, GeminiSignal, NewsItem, TechnicalSnapshot
+from gemini_stock.rules.movement_alerts import DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
 
 
 class Database:
@@ -88,6 +89,17 @@ class Database:
                     created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                     UNIQUE(symbol, profile)
                 );
+
+                CREATE TABLE IF NOT EXISTS movement_alert_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    tier1_pct REAL NOT NULL,
+                    tier2_pct REAL NOT NULL,
+                    tier3_pct REAL NOT NULL,
+                    rise_tier1_pct REAL,
+                    rise_tier2_pct REAL,
+                    rise_tier3_pct REAL,
+                    updated_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                );
                 """
             )
             self._ensure_column(conn, "llm_outputs", "analysis_level", "TEXT")
@@ -95,6 +107,9 @@ class Database:
             self._ensure_column(conn, "llm_outputs", "has_image", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "alerts", "event_key", "TEXT")
             self._ensure_column(conn, "alerts", "alert_type", "TEXT")
+            self._ensure_column(conn, "movement_alert_settings", "rise_tier1_pct", "REAL")
+            self._ensure_column(conn, "movement_alert_settings", "rise_tier2_pct", "REAL")
+            self._ensure_column(conn, "movement_alert_settings", "rise_tier3_pct", "REAL")
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_raw_candles_symbol_interval_timestamp
@@ -115,6 +130,7 @@ class Database:
             )
             self._backfill_llm_metadata(conn)
             self._backfill_alert_metadata(conn)
+            self._ensure_default_movement_alert_settings(conn)
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -271,6 +287,73 @@ class Database:
                 ),
             )
 
+    def get_movement_alert_thresholds(self, event_type: str | None = None) -> list[float]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT tier1_pct, tier2_pct, tier3_pct, rise_tier1_pct, rise_tier2_pct, rise_tier3_pct
+                FROM movement_alert_settings
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return list(DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS)
+        if event_type == "fast_rise":
+            return [
+                float(row["rise_tier1_pct"] if row["rise_tier1_pct"] is not None else row["tier1_pct"]),
+                float(row["rise_tier2_pct"] if row["rise_tier2_pct"] is not None else row["tier2_pct"]),
+                float(row["rise_tier3_pct"] if row["rise_tier3_pct"] is not None else row["tier3_pct"]),
+            ]
+        return [float(row["tier1_pct"]), float(row["tier2_pct"]), float(row["tier3_pct"])]
+
+    def get_movement_alert_threshold_settings(self) -> dict[str, list[float]]:
+        return {
+            "fast_drop": self.get_movement_alert_thresholds("fast_drop"),
+            "fast_rise": self.get_movement_alert_thresholds("fast_rise"),
+        }
+
+    def save_movement_alert_thresholds(self, thresholds: Iterable[float] | dict[str, Iterable[float]]) -> list[float] | dict[str, list[float]]:
+        if isinstance(thresholds, dict):
+            drop = _normalize_movement_thresholds(thresholds.get("fast_drop") or thresholds.get("drop") or self.get_movement_alert_thresholds("fast_drop"))
+            rise = _normalize_movement_thresholds(thresholds.get("fast_rise") or thresholds.get("rise") or self.get_movement_alert_thresholds("fast_rise"))
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO movement_alert_settings
+                        (id, tier1_pct, tier2_pct, tier3_pct, rise_tier1_pct, rise_tier2_pct, rise_tier3_pct, updated_at_utc)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                    ON CONFLICT(id) DO UPDATE SET
+                        tier1_pct = excluded.tier1_pct,
+                        tier2_pct = excluded.tier2_pct,
+                        tier3_pct = excluded.tier3_pct,
+                        rise_tier1_pct = excluded.rise_tier1_pct,
+                        rise_tier2_pct = excluded.rise_tier2_pct,
+                        rise_tier3_pct = excluded.rise_tier3_pct,
+                        updated_at_utc = excluded.updated_at_utc
+                    """,
+                    (*drop, *rise),
+                )
+            return {"fast_drop": drop, "fast_rise": rise}
+
+        normalized = _normalize_movement_thresholds(thresholds)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO movement_alert_settings (id, tier1_pct, tier2_pct, tier3_pct, rise_tier1_pct, rise_tier2_pct, rise_tier3_pct, updated_at_utc)
+                VALUES (1, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    tier1_pct = excluded.tier1_pct,
+                    tier2_pct = excluded.tier2_pct,
+                    tier3_pct = excluded.tier3_pct,
+                    rise_tier1_pct = excluded.rise_tier1_pct,
+                    rise_tier2_pct = excluded.rise_tier2_pct,
+                    rise_tier3_pct = excluded.rise_tier3_pct,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (*normalized, *normalized),
+            )
+        return normalized
+
     def has_alert_event(self, channel: str, event_key: str) -> bool:
         with self.connect() as conn:
             row = conn.execute(
@@ -421,6 +504,26 @@ class Database:
             )
         return normalized
 
+    @staticmethod
+    def _ensure_default_movement_alert_settings(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO movement_alert_settings
+                (id, tier1_pct, tier2_pct, tier3_pct, rise_tier1_pct, rise_tier2_pct, rise_tier3_pct)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
+            """,
+            (*DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS, *DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS),
+        )
+        conn.execute(
+            """
+            UPDATE movement_alert_settings
+            SET rise_tier1_pct = COALESCE(rise_tier1_pct, tier1_pct),
+                rise_tier2_pct = COALESCE(rise_tier2_pct, tier2_pct),
+                rise_tier3_pct = COALESCE(rise_tier3_pct, tier3_pct)
+            WHERE id = 1
+            """
+        )
+
 
 def _parse_datetime(value: str) -> datetime | None:
     try:
@@ -461,3 +564,14 @@ def _extract_llm_metadata(input_json: str) -> tuple[str | None, str | None, int]
 
 def _normalize_symbol(value: str) -> str:
     return "".join(ch for ch in value.upper().strip() if ch.isalnum() or ch in {".", "-", "_"})
+
+
+def _normalize_movement_thresholds(values: Iterable[float]) -> list[float]:
+    thresholds = [round(float(value), 4) for value in values]
+    if len(thresholds) != 3:
+        raise ValueError("movement alert thresholds must contain exactly 3 values")
+    if any(value <= 0 for value in thresholds):
+        raise ValueError("movement alert thresholds must be positive")
+    if thresholds != sorted(thresholds) or len(set(thresholds)) != 3:
+        raise ValueError("movement alert thresholds must be strictly ascending")
+    return thresholds

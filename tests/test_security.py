@@ -10,7 +10,6 @@ def test_secret_config_warnings_detect_real_looking_env_values(tmp_path):
             [
                 "OPENAI_API_KEY=sk-live-looking-value",
                 "FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/token",
-                "REMOTE_MYSQL_PASSWORD=",
             ]
         ),
         encoding="utf-8",
@@ -20,7 +19,6 @@ def test_secret_config_warnings_detect_real_looking_env_values(tmp_path):
 
     assert "OPENAI_API_KEY" in warnings
     assert "FEISHU_WEBHOOK_URL" in warnings
-    assert "REMOTE_MYSQL_PASSWORD" not in warnings
 
 
 def test_secret_config_warnings_ignore_example_placeholders(tmp_path):

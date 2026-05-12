@@ -65,6 +65,12 @@ def test_default_primary_symbols_are_conl_and_tsll(monkeypatch):
     assert Settings(_env_file=None).symbols == ["CONL", "TSLL"]
 
 
+def test_default_movement_alert_symbols_include_btc_only_for_drop_alerts(monkeypatch):
+    monkeypatch.delenv("MOVEMENT_ALERT_SYMBOLS", raising=False)
+
+    assert Settings(_env_file=None).movement_alert_symbols == ["BTC-USD"]
+
+
 def test_alert_rule_marks_strong_buy_alert_reason():
     engine = AlertRuleEngine(cooldown_minutes=60)
 
