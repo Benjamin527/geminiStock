@@ -477,10 +477,25 @@ def render_dashboard(
       padding: 0 10px;
     }}
     main {{ padding: 24px 32px 40px; display: grid; gap: 18px; }}
-    .top-deck {{ position: sticky; top: 0; z-index: 20; background: rgba(15,20,26,.92); backdrop-filter: blur(16px); }}
-    .status {{ display: grid; grid-template-columns: 1.2fr 1fr 1fr 1.4fr; gap: 12px; }}
+    .top-deck {{
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(15,20,26,.94);
+      backdrop-filter: blur(16px);
+      padding: 6px 0 2px;
+      border-bottom: 1px solid rgba(255,255,255,.05);
+    }}
+    .status {{ display: grid; grid-template-columns: 1.1fr .95fr .95fr 1.2fr; gap: 10px; }}
     .metric, section, .card, .stat, .cost-panel, .errors {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 10px 30px rgba(4,9,14,.2); }}
     .metric.primary {{ background: var(--dark); color: #f6f8f4; border-color: var(--line); }}
+    .top-deck .metric {{
+      padding: 10px 12px;
+      border-radius: 10px;
+      box-shadow: 0 6px 18px rgba(4,9,14,.16);
+    }}
+    .top-deck .metric b {{ display: block; font-size: clamp(16px, 2.4vw, 22px); margin-top: 2px; line-height: 1.1; }}
+    .top-deck .metric span {{ color: var(--muted); display: block; font-size: 11px; letter-spacing: .01em; }}
     .metric b {{ display: block; font-size: clamp(18px, 3vw, 26px); margin-top: 3px; line-height: 1.15; }}
     .metric span, .stat span {{ color: var(--muted); display: block; font-size: 12px; }}
     .metric.primary span {{ color: #b9c4bd; }}
@@ -610,6 +625,11 @@ def render_dashboard(
       [data-panel].active-panel {{ display: block; }}
       .top-deck.active-panel {{ display: block; }}
       .overview.active-panel, .split.active-panel {{ display: grid; }}
+      .top-deck {{ padding: 4px 0 0; }}
+      .status {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
+      .top-deck .metric {{ padding: 9px 10px; }}
+      .top-deck .metric b {{ font-size: 16px; }}
+      .top-deck .metric span {{ font-size: 10px; }}
       .desktop-table {{ display: none; }}
       .mobile-feed {{ display: grid; }}
       .benchmark-cards {{ grid-template-columns: 1fr; }}
@@ -622,6 +642,7 @@ def render_dashboard(
       .trade-strip {{ grid-template-columns: 1fr; }}
       .grid {{ grid-template-columns: 1fr 1fr; }}
       .stats {{ grid-template-columns: 1fr 1fr; }}
+      .status {{ grid-template-columns: 1fr 1fr; }}
       .tier-grid {{ grid-template-columns: 1fr; }}
       .threshold-matrix {{ grid-template-columns: 1fr; }}
       .threshold-label {{ padding-bottom: 0; }}
@@ -649,7 +670,9 @@ def render_dashboard(
         <div class="metric"><span>今日报警 / 错误</span><b>{metrics['alerts_today']} / {metrics['llm_errors_today']}</b></div>
         <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
       </div>
-      <h2 style="margin:14px 0 10px;">优先关注</h2>
+    </section>
+    <section class="active-panel" data-panel="main">
+      <h2>优先关注</h2>
       <div class="priority-board">
         {priority_cards}
       </div>
