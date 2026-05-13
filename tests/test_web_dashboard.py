@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -254,10 +255,31 @@ def test_dashboard_page_renders_core_sections(tmp_path, monkeypatch):
     assert "今日运行概览" in response.text
     assert "距离下次执行" in response.text
     assert 'id="next-run-countdown"' in response.text
-    assert "formatCountdown" in response.text
+    assert '/static/dashboard.js' in response.text
     assert 'class="top-deck active-panel"' in response.text
     assert 'class="mobile-tabs"' in response.text
-    assert "<summary>监控与阈值设置</summary>" in response.text
+
+
+def test_dashboard_page_uses_coinbase_template_assets(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot())
+    db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert 'data-dashboard-shell="coinbase"' in response.text
+    assert '/static/dashboard.css' in response.text
+    assert '/static/dashboard.js' in response.text
+    assert "Institutional watch for leveraged AI setups" in response.text
+    assert "监控与阈值设置" in response.text
+    assert '<meta http-equiv="refresh"' not in response.text
+    assert "/api/status" in response.text
+    assert '<script src="/static/dashboard.js"></script>' in response.text
+    assert 'id="dashboard-root"' in response.text
 
 
 def test_dashboard_benchmark_cards_show_regular_session_forecast(tmp_path, monkeypatch):
@@ -454,3 +476,55 @@ def test_dashboard_page_renders_priority_views_at_top(tmp_path, monkeypatch):
 
 def test_to_beijing_time_handles_sqlite_utc_suffix():
     assert to_beijing_time("2026-04-25T16:28:40.101Z") == "2026-04-26 00:28:40 北京时间"
+
+
+def test_dashboard_repository_filters_today_rows_in_sql(tmp_path):
+    db = Database(tmp_path / "dashboard.db")
+    db.initialize()
+    db.save_feature(_snapshot())
+    repo = DashboardRepository(db.path, tmp_path)
+    captured: list[str] = []
+    real_connect = sqlite3.connect
+
+    class CursorProxy:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def fetchall(self):
+            return self._cursor.fetchall()
+
+        def fetchone(self):
+            return self._cursor.fetchone()
+
+        def __iter__(self):
+            return iter(self._cursor)
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class ConnectionProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            captured.append(str(sql))
+            return CursorProxy(self._conn.execute(sql, params))
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._conn.__exit__(exc_type, exc, tb)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def connect_proxy():
+        return ConnectionProxy(real_connect(repo.database_path))
+
+    repo.connect = connect_proxy  # type: ignore[method-assign]
+
+    repo.get_today_metrics(["SPY"])
+
+    assert any("WHERE created_at_utc >=" in sql and "created_at_utc < ?" in sql for sql in captured)

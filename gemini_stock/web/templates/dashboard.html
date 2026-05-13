@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <title>美股 AI 盯盘控制台</title>
+</head>
+<body data-dashboard-shell="coinbase" data-status-endpoint="/api/status">
+  <header class="hero-shell">
+    <div class="hero-bar">
+      <div class="hero-brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <span>Gemini Stock Monitor</span>
+      </div>
+      <div class="hero-caption">Institutional watch for leveraged AI setups</div>
+    </div>
+    <div class="hero-copy">
+      <div>
+        <p class="eyebrow">Coinbase-style monitoring surface</p>
+        <h1>美股 AI 盯盘控制台</h1>
+        <p class="hero-sub">只读监控页面，不提供交易和下单操作。界面采用低噪声、机构感的信息层级，数据仍按 30 秒节奏局部更新。</p>
+      </div>
+      <div class="hero-actions">
+        <button class="hero-pill primary" type="button" onclick="document.querySelector('[data-panel=&quot;settings&quot;]')?.setAttribute('open','open')">监控设置</button>
+        <button class="hero-pill secondary" type="button" onclick="document.getElementById('symbol-cards')?.scrollIntoView({behavior: 'smooth'})">查看主标的</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="dashboard-root">
+    <nav class="mobile-tabs" aria-label="Dashboard sections">
+      <button class="mobile-tab active" type="button" data-tab-target="main">主观察</button>
+      <button class="mobile-tab" type="button" data-tab-target="market">大盘</button>
+      <button class="mobile-tab" type="button" data-tab-target="activity">告警</button>
+      <button class="mobile-tab" type="button" data-tab-target="settings">设置</button>
+    </nav>
+
+    <section class="top-deck active-panel" data-panel="main">
+      <div class="status" id="top-status">$TOP_STATUS</div>
+    </section>
+
+    <section class="priority-section active-panel" data-panel="main">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Priority board</p>
+          <h2>优先关注</h2>
+        </div>
+        <p class="section-copy">优先展示最紧急、最异常、最可执行的标的，减少你在页面中来回扫描的成本。</p>
+      </div>
+      <div class="priority-board" id="priority-board">$PRIORITY_CARDS</div>
+    </section>
+
+    <div class="config-warning sub" id="config-warning">$CONFIG_WARNING</div>
+
+    <details class="settings-drawer" data-panel="settings">
+      <summary>
+        <div>
+          <p class="eyebrow">Configuration</p>
+          <span>监控与阈值设置</span>
+        </div>
+      </summary>
+      <div class="settings-body">
+        <section>
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">Watchlist</p>
+              <h2>监控列表</h2>
+            </div>
+          </div>
+          <div class="watch-panel">
+            <div class="watch-meta">
+              <div class="sub" id="watch-primary-summary">主监控：$WATCH_PRIMARY</div>
+              <div class="sub" id="watch-benchmark-summary">参考监控：$WATCH_BENCHMARK</div>
+              <div class="watch-badges">$PRIMARY_WATCH_ITEMS</div>
+            </div>
+            <form class="watch-form" id="watch-form">
+              <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
+              <button class="watch-btn" type="submit">加入监控</button>
+            </form>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">Thresholds</p>
+              <h2>价格异动阈值</h2>
+            </div>
+            <p class="section-copy">快跌和快涨分别设置三档；1档推送 1 次，2档推送 2 次，3档推送 3 次。</p>
+          </div>
+          <div class="movement-settings">
+            <div>
+              <form class="threshold-matrix" id="movement-settings-form">
+                <div class="threshold-label">下跌</div>
+                <div class="tier-field">
+                  <label for="drop-tier1-pct">下跌 1档 %</label>
+                  <input class="tier-input" id="drop-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="$DROP_TIER_1" required>
+                </div>
+                <div class="tier-field">
+                  <label for="drop-tier2-pct">下跌 2档 %</label>
+                  <input class="tier-input" id="drop-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="$DROP_TIER_2" required>
+                </div>
+                <div class="tier-field">
+                  <label for="drop-tier3-pct">下跌 3档 %</label>
+                  <input class="tier-input" id="drop-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="$DROP_TIER_3" required>
+                </div>
+                <div class="threshold-label">上涨</div>
+                <div class="tier-field">
+                  <label for="rise-tier1-pct">上涨 1档 %</label>
+                  <input class="tier-input" id="rise-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="$RISE_TIER_1" required>
+                </div>
+                <div class="tier-field">
+                  <label for="rise-tier2-pct">上涨 2档 %</label>
+                  <input class="tier-input" id="rise-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="$RISE_TIER_2" required>
+                </div>
+                <div class="tier-field">
+                  <label for="rise-tier3-pct">上涨 3档 %</label>
+                  <input class="tier-input" id="rise-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="$RISE_TIER_3" required>
+                </div>
+              </form>
+            </div>
+            <button class="watch-btn" type="submit" form="movement-settings-form">保存阈值</button>
+          </div>
+        </section>
+      </div>
+    </details>
+
+    <section class="active-panel" data-panel="main">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Primary watchlist</p>
+          <h2>主观察</h2>
+        </div>
+        <p class="section-copy">交易动作、价位计划和技术上下文统一收在同一张卡片里，优先帮助你判断是否需要介入。</p>
+      </div>
+      <div class="cards" id="symbol-cards">$SYMBOL_CARDS</div>
+    </section>
+
+    <section data-panel="market">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Benchmarks</p>
+          <h2>大盘观察</h2>
+        </div>
+        <p class="section-copy">用更轻的市场摘要卡片查看参考指数方向、区间和触发位。</p>
+      </div>
+      <div class="benchmark-cards" id="benchmark-cards">$BENCHMARK_CARDS</div>
+    </section>
+
+    <div class="overview" data-panel="activity">
+      <section>
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Operations</p>
+            <h2>今日运行概览</h2>
+          </div>
+        </div>
+        <div class="stats" id="metric-cards">$METRIC_CARDS</div>
+      </section>
+      <div class="cost-panel" id="cost-panel">$COST_PANEL</div>
+    </div>
+
+    <div class="split" data-panel="activity">
+      <section>
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">AI timeline</p>
+            <h2>最近执行时间线</h2>
+          </div>
+        </div>
+        <table class="desktop-table"><thead><tr><th>时间</th><th>标的</th><th>级别</th><th>传图</th><th>方向</th><th>分数</th><th>置信度</th><th>视觉复核</th><th>错误</th></tr></thead><tbody id="llm-rows">$LLM_ROWS</tbody></table>
+        <div class="mobile-feed" id="llm-mobile-cards">$LLM_MOBILE_CARDS</div>
+      </section>
+      <aside class="errors">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Error review</p>
+            <h2>近期错误</h2>
+          </div>
+        </div>
+        <ul id="error-items">$ERROR_ITEMS</ul>
+      </aside>
+    </div>
+
+    <section data-panel="activity">
+      <div class="section-heading compact">
+        <div>
+          <p class="eyebrow">Alerts</p>
+          <h2>最近报警</h2>
+        </div>
+      </div>
+      <table class="desktop-table"><thead><tr><th>时间</th><th>类型</th><th>标的</th><th>渠道</th><th>方向</th><th>分数</th><th>置信度</th></tr></thead><tbody id="alert-rows">$ALERT_ROWS</tbody></table>
+      <div class="mobile-feed" id="alert-mobile-cards">$ALERT_MOBILE_CARDS</div>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

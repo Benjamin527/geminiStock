@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from string import Template
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -12,6 +14,11 @@ from gemini_stock.rules.movement_alerts import DEFAULT_MOVEMENT_ALERT_THRESHOLD_
 from gemini_stock.rules.trade_plan import has_actionable_trade_levels
 from gemini_stock.storage.db import Database
 from gemini_stock.web.repository import DashboardRepository, utc_now_iso
+
+WEB_DIR = Path(__file__).resolve().parent
+STATIC_DIR = WEB_DIR / "static"
+TEMPLATE_DIR = WEB_DIR / "templates"
+DASHBOARD_TEMPLATE_PATH = TEMPLATE_DIR / "dashboard.html"
 
 
 def create_app(
@@ -26,6 +33,7 @@ def create_app(
     app = FastAPI(title="Gemini Stock Dashboard")
     charts.mkdir(parents=True, exist_ok=True)
     app.mount("/charts", StaticFiles(directory=charts), name="charts")
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     repo = DashboardRepository(db_path, charts)
     db = Database(db_path)
     db.initialize()
@@ -63,40 +71,64 @@ def create_app(
             "configurable": True,
         }
 
-    @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
+    def build_dashboard_payload() -> dict[str, Any]:
         symbols_now = selected_symbols()
         benchmarks_now = selected_benchmarks()
+        status = repo.get_status()
+        metrics = repo.get_today_metrics(symbols_now)
+        symbol_states = repo.get_symbol_states(symbols_now)
+        benchmark_states = repo.get_benchmark_states(benchmarks_now)
+        llm_outputs = repo.get_recent_llm_outputs(symbols_now)
+        alerts = repo.get_recent_alerts(symbols_now + benchmarks_now)
+        errors = repo.get_recent_errors(symbols_now)
+        watchlist = watchlist_payload()
+        movement_alert_settings = movement_alert_settings_payload()
+        priority_views = repo.build_priority_views(symbols_now, benchmarks_now)
+        return {
+            "generated_at_utc": utc_now_iso(),
+            "status": status,
+            "today_metrics": metrics,
+            "symbols": symbol_states,
+            "benchmarks": benchmark_states,
+            "recent_llm_outputs": llm_outputs,
+            "recent_alerts": alerts,
+            "recent_errors": errors,
+            "watchlist": watchlist,
+            "movement_alert_settings": movement_alert_settings,
+            "priority_views": priority_views,
+            "fragments": build_dashboard_fragments(
+                status=status,
+                metrics=metrics,
+                symbols=symbol_states,
+                benchmarks=benchmark_states,
+                llm_outputs=llm_outputs,
+                alerts=alerts,
+                errors=errors,
+                watchlist=watchlist,
+                priority_views=priority_views,
+            ),
+        }
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        payload = build_dashboard_payload()
         return render_dashboard(
-            status=repo.get_status(),
-            metrics=repo.get_today_metrics(symbols_now),
-            symbols=repo.get_symbol_states(symbols_now),
-            benchmarks=repo.get_benchmark_states(benchmarks_now),
-            llm_outputs=repo.get_recent_llm_outputs(symbols_now),
-            alerts=repo.get_recent_alerts(symbols_now + benchmarks_now),
-            errors=repo.get_recent_errors(symbols_now),
-            watchlist=watchlist_payload(),
-            movement_alert_settings=movement_alert_settings_payload(),
-            priority_views=repo.build_priority_views(symbols_now, benchmarks_now),
+            status=payload["status"],
+            metrics=payload["today_metrics"],
+            symbols=payload["symbols"],
+            benchmarks=payload["benchmarks"],
+            llm_outputs=payload["recent_llm_outputs"],
+            alerts=payload["recent_alerts"],
+            errors=payload["recent_errors"],
+            watchlist=payload["watchlist"],
+            movement_alert_settings=payload["movement_alert_settings"],
+            priority_views=payload["priority_views"],
+            fragments=payload["fragments"],
         )
 
     @app.get("/api/status")
     def api_status() -> dict:
-        symbols_now = selected_symbols()
-        benchmarks_now = selected_benchmarks()
-        return {
-            "generated_at_utc": utc_now_iso(),
-            "status": repo.get_status(),
-            "today_metrics": repo.get_today_metrics(symbols_now),
-            "symbols": repo.get_symbol_states(symbols_now),
-            "benchmarks": repo.get_benchmark_states(benchmarks_now),
-            "recent_llm_outputs": repo.get_recent_llm_outputs(symbols_now),
-            "recent_alerts": repo.get_recent_alerts(symbols_now + benchmarks_now),
-            "recent_errors": repo.get_recent_errors(symbols_now),
-            "watchlist": watchlist_payload(),
-            "movement_alert_settings": movement_alert_settings_payload(),
-            "priority_views": repo.build_priority_views(symbols_now, benchmarks_now),
-        }
+        return build_dashboard_payload()
 
     @app.get("/api/health")
     def api_health() -> dict:
@@ -300,7 +332,7 @@ def _price_in_zone(price, zone) -> bool:
     return low <= float(price) <= high
 
 
-def render_dashboard(
+def build_dashboard_fragments(
     status: dict,
     metrics: dict,
     symbols: list[dict],
@@ -309,9 +341,8 @@ def render_dashboard(
     alerts: list[dict],
     errors: list[dict],
     watchlist: dict[str, list[str]],
-    movement_alert_settings: dict,
     priority_views: dict[str, list[dict]] | None = None,
-) -> str:
+) -> dict[str, str]:
     ordered_symbols = sorted(symbols, key=_symbol_sort_key)
     symbol_cards = "\n".join(_render_symbol_card(item) for item in ordered_symbols)
     benchmark_cards = "\n".join(_render_benchmark_card(item) for item in benchmarks)
@@ -351,7 +382,7 @@ def render_dashboard(
     alert_rows = "\n".join(
         f"""
         <tr>
-          <td>{row['created_at_utc']}</td><td><span class="feed-type">{row.get('category', '系统记录')}</span></td><td>{row['symbol']}</td><td>{row['channel']}</td>
+          <td>{row['created_at_utc']}</td><td><span class=\"feed-type\">{row.get('category', '系统记录')}</span></td><td>{row['symbol']}</td><td>{row['channel']}</td>
           <td>{_label(row['bias'])}</td><td>{_fmt(row['sentiment_score'])}</td><td>{_fmt(row['confidence'])}</td>
         </tr>
         """
@@ -361,8 +392,6 @@ def render_dashboard(
         f"<li><b>{row['symbol']}</b><span>{row['created_at_utc']} · {_label(row['analysis_level'])}</span><p>{row['error']}</p></li>"
         for row in errors
     ) or "<li class='muted-row'>暂无近期错误</li>"
-    monitored_primary = " · ".join(watchlist.get("primary") or [])
-    monitored_benchmark = " · ".join(watchlist.get("benchmark") or [])
     priority_views = priority_views or {}
     priority_sections = [
         ("最紧急", priority_views.get("most_urgent", [])),
@@ -380,6 +409,58 @@ def render_dashboard(
         """
         for title, items in priority_sections
     )
+    return {
+        "top_status": (
+            f'<div class="metric primary"><span>距离下次执行</span><b id="next-run-countdown" data-seconds="{int(status.get("countdown_seconds") or 0)}">{status["countdown_label"]}</b></div>'
+            f'<div class="metric"><span>市场阶段</span><b>{_label(status["market_session"])}</b></div>'
+            f'<div class="metric"><span>今日报警 / 错误</span><b>{metrics["alerts_today"]} / {metrics["llm_errors_today"]}</b></div>'
+            f'<div class="metric"><span>后台状态</span><b>{worker_state}</b></div>'
+        ),
+        "priority_cards": priority_cards,
+        "config_warning": f"配置提醒：本地 .env 含敏感字段 {warning_text}，建议轮换并移入密钥管理。" if warning_text else "",
+        "symbol_cards": symbol_cards,
+        "benchmark_cards": benchmark_cards,
+        "metric_cards": metric_cards,
+        "cost_panel": (
+            '<h2>AI 调用成本代理</h2>'
+            f'<div class="bar" aria-label="JSON 与图像调用比例" style="grid-template-columns: {json_pct}fr {image_pct}fr;"><i></i><i></i></div>'
+            f'<div class="legend"><span>JSON-only {json_count} 次</span><span>传图 {image_count} 次</span></div>'
+            "<p class=\"sub\">日常扫描优先 JSON，强候选才进入图像复核。</p>"
+        ),
+        "llm_rows": llm_rows,
+        "llm_mobile_cards": llm_mobile_cards,
+        "error_items": error_items,
+        "alert_rows": alert_rows,
+        "alert_mobile_cards": alert_mobile_cards,
+        "watch_primary": " · ".join(watchlist.get("primary") or []) or "-",
+        "watch_benchmark": " · ".join(watchlist.get("benchmark") or []) or "-",
+    }
+
+
+def render_dashboard(
+    status: dict,
+    metrics: dict,
+    symbols: list[dict],
+    benchmarks: list[dict],
+    llm_outputs: list[dict],
+    alerts: list[dict],
+    errors: list[dict],
+    watchlist: dict[str, list[str]],
+    movement_alert_settings: dict,
+    priority_views: dict[str, list[dict]] | None = None,
+    fragments: dict[str, str] | None = None,
+) -> str:
+    fragments = fragments or build_dashboard_fragments(
+        status=status,
+        metrics=metrics,
+        symbols=symbols,
+        benchmarks=benchmarks,
+        llm_outputs=llm_outputs,
+        alerts=alerts,
+        errors=errors,
+        watchlist=watchlist,
+        priority_views=priority_views,
+    )
     primary_watch_items = "".join(
         f"""
         <div class="watch-chip">
@@ -391,495 +472,36 @@ def render_dashboard(
     ) or "<span class='watch-badge'>暂无</span>"
     drop_thresholds = movement_alert_settings.get("fast_drop") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
     rise_thresholds = movement_alert_settings.get("fast_rise") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
-    countdown_seconds = int(status.get("countdown_seconds") or 0)
-    return f"""
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@600;700&display=swap" rel="stylesheet">
-  <title>美股 AI 盯盘控制台</title>
-  <style>
-    :root {{
-      --bg: #0f141a; --panel: #17202a; --ink: #e8edf4; --muted: #9fb0c4;
-      --line: #273647; --green: #1bc18f; --red: #ef6f7a; --amber: #f5b94c; --blue: #66b7ff;
-      --soft: #1e2b39; --dark: #0a1016;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: radial-gradient(circle at 8% 0%, #1a2633 0, #0f141a 38%), var(--bg); color: var(--ink); font: 14px/1.5 "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif; }}
-    header {{ padding: 22px 32px 14px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #121a24, #0e151d); }}
-    h1 {{ margin: 0; font-size: clamp(22px, 4vw, 34px); letter-spacing: 0; font-family: "Sora", "IBM Plex Sans", sans-serif; }}
-    h2 {{ margin: 0 0 12px; font-size: 16px; }}
-    .sub {{ color: var(--muted); margin-top: 4px; }}
-    .watch-panel {{ display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }}
-    .watch-meta {{ display: grid; gap: 8px; }}
-    .watch-badges {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .watch-chip {{ display: inline-flex; align-items: center; gap: 6px; }}
-    .watch-badge {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; color: var(--ink); background: rgba(102,183,255,.08); }}
-    .watch-remove {{
-      border: 1px solid rgba(255,255,255,.14);
-      border-radius: 999px;
-      background: rgba(255,255,255,.04);
-      color: var(--muted);
-      font-size: 12px;
-      padding: 4px 8px;
-      cursor: pointer;
-    }}
-    .watch-remove:hover {{ color: var(--ink); border-color: rgba(255,255,255,.24); }}
-    .watch-form {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
-    .watch-input {{
-      width: 180px;
-      height: 36px;
-      border-radius: 8px;
-      border: 1px solid var(--line);
-      background: #0d1722;
-      color: var(--ink);
-      padding: 0 10px;
-      text-transform: uppercase;
-      letter-spacing: 0;
-    }}
-    .watch-btn {{
-      height: 36px;
-      border: 1px solid rgba(27,193,143,.45);
-      border-radius: 8px;
-      background: linear-gradient(180deg, rgba(27,193,143,.28), rgba(27,193,143,.15));
-      color: #d8ffef;
-      font-weight: 600;
-      padding: 0 14px;
-      cursor: pointer;
-    }}
-    .watch-btn:hover {{ filter: brightness(1.08); }}
-    details.settings-drawer {{ padding: 0; overflow: hidden; }}
-    details.settings-drawer > summary {{
-      list-style: none; cursor: pointer; padding: 15px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      color: var(--ink); font-weight: 700;
-    }}
-    details.settings-drawer > summary::-webkit-details-marker {{ display: none; }}
-    details.settings-drawer > summary::after {{ content: "展开"; color: var(--muted); font-size: 12px; font-weight: 600; }}
-    details.settings-drawer[open] > summary::after {{ content: "收起"; }}
-    .settings-body {{ display: grid; gap: 14px; padding: 0 14px 14px; }}
-    .movement-settings {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }}
-    .threshold-matrix {{ display: grid; grid-template-columns: 90px repeat(3, minmax(110px, 1fr)); gap: 10px; align-items: end; }}
-    .threshold-label {{ color: var(--muted); font-weight: 700; padding-bottom: 10px; }}
-    .tier-grid {{ display: grid; grid-template-columns: repeat(3, minmax(110px, 1fr)); gap: 10px; }}
-    .tier-field {{ display: grid; gap: 5px; }}
-    .tier-field label {{ color: var(--muted); font-size: 12px; }}
-    .tier-input {{
-      height: 36px;
-      border-radius: 8px;
-      border: 1px solid var(--line);
-      background: #0d1722;
-      color: var(--ink);
-      padding: 0 10px;
-    }}
-    main {{ padding: 24px 32px 40px; display: grid; gap: 18px; }}
-    .top-deck {{
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      background: rgba(15,20,26,.94);
-      backdrop-filter: blur(16px);
-      padding: 6px 0 2px;
-      border-bottom: 1px solid rgba(255,255,255,.05);
-    }}
-    .status {{ display: grid; grid-template-columns: 1.1fr .95fr .95fr 1.2fr; gap: 10px; }}
-    .metric, section, .card, .stat, .cost-panel, .errors {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 10px 30px rgba(4,9,14,.2); }}
-    .metric.primary {{ background: var(--dark); color: #f6f8f4; border-color: var(--line); }}
-    .top-deck .metric {{
-      padding: 10px 12px;
-      border-radius: 10px;
-      box-shadow: 0 6px 18px rgba(4,9,14,.16);
-    }}
-    .top-deck .metric b {{ display: block; font-size: clamp(16px, 2.4vw, 22px); margin-top: 2px; line-height: 1.1; }}
-    .top-deck .metric span {{ color: var(--muted); display: block; font-size: 11px; letter-spacing: .01em; }}
-    .metric b {{ display: block; font-size: clamp(18px, 3vw, 26px); margin-top: 3px; line-height: 1.15; }}
-    .metric span, .stat span {{ color: var(--muted); display: block; font-size: 12px; }}
-    .metric.primary span {{ color: #b9c4bd; }}
-    .overview {{ display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 12px; }}
-    .priority-board {{ margin-top: 12px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
-    .priority-group {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
-    .priority-group h3 {{ margin: 0 0 10px; font-size: 14px; color: var(--muted); }}
-    .priority-list {{ display: grid; gap: 8px; }}
-    .priority-item {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #121b27; }}
-    .priority-item b {{ display: block; font-size: 15px; }}
-    .priority-meta {{ display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; margin-top: 4px; }}
-    .priority-score {{ color: var(--ink); font-weight: 700; }}
-    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 10px; }}
-    .stat b {{ display: block; margin-top: 2px; font-size: 24px; }}
-    .cost-panel h2 {{ margin-bottom: 10px; }}
-    .bar {{ height: 14px; border: 1px solid var(--line); background: #101923; display: grid; grid-template-columns: {json_pct}fr {image_pct}fr; overflow: hidden; border-radius: 999px; }}
-    .bar i:first-child {{ background: var(--green); }}
-    .bar i:last-child {{ background: var(--amber); }}
-    .legend {{ display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; margin-top: 8px; }}
-    .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }}
-    .benchmark-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }}
-    .mobile-feed {{ display: none; gap: 10px; }}
-    .mobile-tabs {{ display: none; position: sticky; top: 0; z-index: 30; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(10,16,22,.94); backdrop-filter: blur(14px); grid-template-columns: repeat(4, 1fr); gap: 6px; }}
-    .mobile-tab {{ min-height: 36px; border: 1px solid var(--line); border-radius: 7px; background: #111b26; color: var(--muted); font-weight: 700; }}
-    .mobile-tab.active {{ color: var(--ink); border-color: rgba(27,193,143,.45); background: rgba(27,193,143,.12); }}
-    .card {{ background:
-        radial-gradient(circle at top right, rgba(102,183,255,.12), transparent 28%),
-        linear-gradient(180deg, #18222e, #141d28); }}
-    .benchmark-card {{
-      background: linear-gradient(180deg, #1a2431, #141d28);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px;
-      box-shadow: 0 1px 0 rgba(20,30,25,.03);
-    }}
-    .benchmark-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px; }}
-    .benchmark-head b {{ font-size: 22px; }}
-    .benchmark-note {{ color: var(--ink); margin: 10px 0 12px; font-size: 13px; }}
-    .benchmark-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
-    .scenario-group {{ margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }}
-    .scenario-group summary {{ cursor: pointer; color: var(--muted); font-size: 12px; }}
-    .scenario-list {{ margin-top: 8px; display: grid; gap: 8px; }}
-    .card-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }}
-    .symbol {{ font-size: 24px; font-weight: 700; }}
-    .headline {{ display: flex; flex-direction: column; gap: 8px; }}
-    .meta-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .pill {{ display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.03); font-size: 12px; color: var(--muted); }}
-    .pill.bias-bullish {{ background: rgba(13,119,86,.12); color: var(--green); border-color: rgba(13,119,86,.22); }}
-    .pill.bias-bearish {{ background: rgba(182,61,50,.10); color: var(--red); border-color: rgba(182,61,50,.22); }}
-    .pill.bias-neutral {{ background: rgba(36,92,131,.08); color: var(--blue); border-color: rgba(36,92,131,.2); }}
-    .score-wrap {{ text-align: right; min-width: 88px; }}
-    .score {{ font-size: 30px; font-weight: 700; line-height: 1; color: var(--green); }}
-    .score.negative {{ color: var(--red); }}
-    .confidence {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
-    .action-banner {{
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      padding: 10px 12px; margin: 0 0 12px; border: 1px solid var(--line); border-radius: 8px;
-      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.01));
-    }}
-    .action-copy {{ min-width: 0; }}
-    .action-copy span {{ display: block; color: var(--muted); font-size: 12px; }}
-    .action-copy b {{ display: block; font-size: 17px; line-height: 1.25; margin-top: 2px; }}
-    .action-tag {{
-      flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
-      min-width: 88px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
-      background: rgba(255,255,255,.03); font-size: 13px; font-weight: 600;
-    }}
-    .action-tag.bullish {{ color: var(--green); border-color: rgba(13,119,86,.25); background: rgba(13,119,86,.08); }}
-    .action-tag.bearish {{ color: var(--red); border-color: rgba(182,61,50,.25); background: rgba(182,61,50,.08); }}
-    .action-tag.neutral {{ color: var(--blue); border-color: rgba(36,92,131,.25); background: rgba(36,92,131,.08); }}
-    .action-banner.urgent {{ border-color: rgba(239,111,122,.45); background: rgba(239,111,122,.10); }}
-    .action-banner.ready {{ border-color: rgba(27,193,143,.45); background: rgba(27,193,143,.10); }}
-    .action-banner.watch {{ border-color: rgba(245,185,76,.42); background: rgba(245,185,76,.08); }}
-    .trade-strip {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }}
-    .trade-box {{ padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #12202e; min-width: 0; }}
-    .trade-box span {{ display: block; color: var(--muted); font-size: 12px; }}
-    .trade-box b {{ display: block; margin-top: 3px; font-size: 15px; line-height: 1.3; overflow-wrap: anywhere; }}
-    .trade-box.muted {{ background: #111923; border-color: rgba(159,176,196,.25); }}
-    .trade-box.muted b {{ color: var(--muted); }}
-    .plan-note {{
-      margin: -4px 0 12px;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.4;
-    }}
-    .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
-    .cell {{ border-top: 1px solid var(--line); padding-top: 8px; min-width: 0; }}
-    .cell span {{ color: var(--muted); display: block; font-size: 12px; }}
-    .events {{ margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap; }}
-    .event {{ padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.03); font-size: 12px; }}
-    .chart {{ margin-top: 12px; max-width: 100%; border: 1px solid var(--line); border-radius: 6px; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ text-align: left; padding: 9px 8px; border-top: 1px solid var(--line); vertical-align: top; }}
-    th {{ color: var(--muted); font-weight: 600; }}
-    .split {{ display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr); gap: 12px; align-items: start; }}
-    .feed-card {{
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #121b27;
-      padding: 12px;
-      display: grid;
-      gap: 6px;
-    }}
-    .feed-top {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }}
-    .feed-top b {{ font-size: 15px; }}
-    .feed-meta {{ color: var(--muted); font-size: 12px; }}
-    .feed-type {{ display: inline-flex; width: fit-content; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 12px; }}
-    .errors ul {{ list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }}
-    .errors li {{ border-top: 1px solid var(--line); padding-top: 10px; }}
-    .errors li:first-child {{ border-top: 0; padding-top: 0; }}
-    .errors span {{ display: block; color: var(--muted); font-size: 12px; }}
-    .errors p {{ margin: 4px 0 0; color: var(--red); overflow-wrap: anywhere; }}
-    .muted-row {{ color: var(--muted); }}
-    @media (max-width: 980px) {{
-      .status, .overview, .split {{ grid-template-columns: 1fr; }}
-      .priority-board {{ grid-template-columns: 1fr; }}
-      .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .watch-panel {{ grid-template-columns: 1fr; }}
-      .watch-form {{ justify-content: flex-start; }}
-      .movement-settings {{ grid-template-columns: 1fr; }}
-      header, main {{ padding-left: 16px; padding-right: 16px; }}
-      table {{ display: block; overflow-x: auto; white-space: nowrap; }}
-    }}
-    @media (max-width: 680px) {{
-      .mobile-tabs {{ display: grid; }}
-      [data-panel] {{ display: none; }}
-      [data-panel].active-panel {{ display: block; }}
-      .top-deck.active-panel {{ display: block; }}
-      .overview.active-panel, .split.active-panel {{ display: grid; }}
-      .top-deck {{ padding: 4px 0 0; }}
-      .status {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
-      .top-deck .metric {{ padding: 9px 10px; }}
-      .top-deck .metric b {{ font-size: 16px; }}
-      .top-deck .metric span {{ font-size: 10px; }}
-      .desktop-table {{ display: none; }}
-      .mobile-feed {{ display: grid; }}
-      .benchmark-cards {{ grid-template-columns: 1fr; }}
-      .benchmark-grid {{ grid-template-columns: 1fr 1fr; }}
-      .action-banner {{ align-items: flex-start; flex-direction: column; }}
-      .action-tag {{ min-width: 0; }}
-    }}
-    @media (max-width: 520px) {{
-      .cards {{ grid-template-columns: 1fr; }}
-      .trade-strip {{ grid-template-columns: 1fr; }}
-      .grid {{ grid-template-columns: 1fr 1fr; }}
-      .stats {{ grid-template-columns: 1fr 1fr; }}
-      .status {{ grid-template-columns: 1fr 1fr; }}
-      .tier-grid {{ grid-template-columns: 1fr; }}
-      .threshold-matrix {{ grid-template-columns: 1fr; }}
-      .threshold-label {{ padding-bottom: 0; }}
-      .metric, section, .card, .stat, .cost-panel, .errors {{ padding: 12px; }}
-      .benchmark-grid {{ grid-template-columns: 1fr; }}
-    }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>美股 AI 盯盘控制台</h1>
-    <div class="sub">只读监控页面，不提供交易和下单操作。页面每 30 秒自动刷新。</div>
-  </header>
-  <main>
-    <nav class="mobile-tabs" aria-label="Dashboard sections">
-      <button class="mobile-tab active" type="button" data-tab-target="main">主观察</button>
-      <button class="mobile-tab" type="button" data-tab-target="market">大盘</button>
-      <button class="mobile-tab" type="button" data-tab-target="activity">告警</button>
-      <button class="mobile-tab" type="button" data-tab-target="settings">设置</button>
-    </nav>
-    <section class="top-deck active-panel" data-panel="main">
-      <div class="status">
-        <div class="metric primary"><span>距离下次执行</span><b id="next-run-countdown" data-seconds="{countdown_seconds}">{status['countdown_label']}</b></div>
-        <div class="metric"><span>市场阶段</span><b>{_label(status['market_session'])}</b></div>
-        <div class="metric"><span>今日报警 / 错误</span><b>{metrics['alerts_today']} / {metrics['llm_errors_today']}</b></div>
-        <div class="metric"><span>后台状态</span><b>{worker_state}</b></div>
-      </div>
-    </section>
-    <section class="active-panel" data-panel="main">
-      <h2>优先关注</h2>
-      <div class="priority-board">
-        {priority_cards}
-      </div>
-    </section>
-    <div class="sub">{'配置提醒：本地 .env 含敏感字段 ' + warning_text + '，建议轮换并移入密钥管理。' if warning_text else ''}</div>
-    <details class="settings-drawer" data-panel="settings">
-      <summary>监控与阈值设置</summary>
-      <div class="settings-body">
-        <section>
-          <h2>监控列表</h2>
-          <div class="watch-panel">
-            <div class="watch-meta">
-              <div class="sub">主监控：{monitored_primary or '-'}</div>
-              <div class="sub">参考监控：{monitored_benchmark or '-'}</div>
-              <div class="watch-badges">{primary_watch_items}</div>
-            </div>
-            <form class="watch-form" id="watch-form">
-              <input class="watch-input" id="watch-symbol" name="symbol" placeholder="输入代码，如 NVDA" maxlength="10" required>
-              <button class="watch-btn" type="submit">加入监控</button>
-            </form>
-          </div>
-        </section>
-        <section>
-          <h2>价格异动阈值</h2>
-          <div class="movement-settings">
-            <div>
-              <div class="sub">快跌和快涨分别设置三档；1档推送 1 次，2档推送 2 次，3档推送 3 次。</div>
-              <form class="threshold-matrix" id="movement-settings-form">
-                <div class="threshold-label">下跌</div>
-                <div class="tier-field">
-                  <label for="drop-tier1-pct">下跌 1档 %</label>
-                  <input class="tier-input" id="drop-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[0]}" required>
-                </div>
-                <div class="tier-field">
-                  <label for="drop-tier2-pct">下跌 2档 %</label>
-                  <input class="tier-input" id="drop-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[1]}" required>
-                </div>
-                <div class="tier-field">
-                  <label for="drop-tier3-pct">下跌 3档 %</label>
-                  <input class="tier-input" id="drop-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="{drop_thresholds[2]}" required>
-                </div>
-                <div class="threshold-label">上涨</div>
-                <div class="tier-field">
-                  <label for="rise-tier1-pct">上涨 1档 %</label>
-                  <input class="tier-input" id="rise-tier1-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[0]}" required>
-                </div>
-                <div class="tier-field">
-                  <label for="rise-tier2-pct">上涨 2档 %</label>
-                  <input class="tier-input" id="rise-tier2-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[1]}" required>
-                </div>
-                <div class="tier-field">
-                  <label for="rise-tier3-pct">上涨 3档 %</label>
-                  <input class="tier-input" id="rise-tier3-pct" type="number" min="0.1" max="99" step="0.1" value="{rise_thresholds[2]}" required>
-                </div>
-              </form>
-            </div>
-            <button class="watch-btn" type="submit" form="movement-settings-form">保存阈值</button>
-          </div>
-        </section>
-      </div>
-    </details>
-    <section class="active-panel" data-panel="main">
-      <h2>主观察</h2>
-      <div class="cards">{symbol_cards}</div>
-    </section>
-    <section data-panel="market">
-      <h2>大盘观察</h2>
-      <div class="benchmark-cards">{benchmark_cards}</div>
-    </section>
-    <div class="overview" data-panel="activity">
-      <section>
-        <h2>今日运行概览</h2>
-        <div class="stats">{metric_cards}</div>
-      </section>
-      <div class="cost-panel">
-        <h2>AI 调用成本代理</h2>
-        <div class="bar" aria-label="JSON 与图像调用比例"><i></i><i></i></div>
-        <div class="legend"><span>JSON-only {json_count} 次</span><span>传图 {image_count} 次</span></div>
-        <p class="sub">日常扫描优先 JSON，强候选才进入图像复核。</p>
-      </div>
-    </div>
-    <div class="split" data-panel="activity">
-      <section>
-        <h2>最近执行时间线</h2>
-        <table class="desktop-table"><thead><tr><th>时间</th><th>标的</th><th>级别</th><th>传图</th><th>方向</th><th>分数</th><th>置信度</th><th>视觉复核</th><th>错误</th></tr></thead><tbody>{llm_rows}</tbody></table>
-        <div class="mobile-feed">{llm_mobile_cards}</div>
-      </section>
-      <aside class="errors">
-        <h2>近期错误</h2>
-        <ul>{error_items}</ul>
-      </aside>
-    </div>
-    <section data-panel="activity">
-      <h2>最近报警</h2>
-      <table class="desktop-table"><thead><tr><th>时间</th><th>类型</th><th>标的</th><th>渠道</th><th>方向</th><th>分数</th><th>置信度</th></tr></thead><tbody>{alert_rows}</tbody></table>
-      <div class="mobile-feed">{alert_mobile_cards}</div>
-    </section>
-  </main>
-  <script>
-    const countdownEl = document.getElementById("next-run-countdown");
-    if (countdownEl) {{
-      let remainingSeconds = Number.parseInt(countdownEl.dataset.seconds || "0", 10);
-      const formatCountdown = (seconds) => {{
-        if (!Number.isFinite(seconds) || seconds <= 0) {{
-          return "即将执行";
-        }}
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        const s = seconds % 60;
-        if (h > 0) {{
-          return `${{h}}时${{m}}分${{s}}秒`;
-        }}
-        return `${{m}}分${{s}}秒`;
-      }};
-      countdownEl.textContent = formatCountdown(remainingSeconds);
-      setInterval(() => {{
-        remainingSeconds = Math.max(remainingSeconds - 1, 0);
-        countdownEl.textContent = formatCountdown(remainingSeconds);
-      }}, 1000);
-    }}
+    return _render_dashboard_template(
+        {
+            "TOP_STATUS": fragments["top_status"],
+            "PRIORITY_CARDS": fragments["priority_cards"],
+            "CONFIG_WARNING": fragments["config_warning"],
+            "WATCH_PRIMARY": fragments["watch_primary"],
+            "WATCH_BENCHMARK": fragments["watch_benchmark"],
+            "PRIMARY_WATCH_ITEMS": primary_watch_items,
+            "DROP_TIER_1": str(drop_thresholds[0]),
+            "DROP_TIER_2": str(drop_thresholds[1]),
+            "DROP_TIER_3": str(drop_thresholds[2]),
+            "RISE_TIER_1": str(rise_thresholds[0]),
+            "RISE_TIER_2": str(rise_thresholds[1]),
+            "RISE_TIER_3": str(rise_thresholds[2]),
+            "SYMBOL_CARDS": fragments["symbol_cards"],
+            "BENCHMARK_CARDS": fragments["benchmark_cards"],
+            "METRIC_CARDS": fragments["metric_cards"],
+            "COST_PANEL": fragments["cost_panel"],
+            "LLM_ROWS": fragments["llm_rows"],
+            "LLM_MOBILE_CARDS": fragments["llm_mobile_cards"],
+            "ERROR_ITEMS": fragments["error_items"],
+            "ALERT_ROWS": fragments["alert_rows"],
+            "ALERT_MOBILE_CARDS": fragments["alert_mobile_cards"],
+        }
+    )
 
-    const watchForm = document.getElementById("watch-form");
-    if (watchForm) {{
-      watchForm.addEventListener("submit", async (event) => {{
-        event.preventDefault();
-        const input = document.getElementById("watch-symbol");
-        const symbol = (input.value || "").trim().toUpperCase();
-        if (!symbol) return;
-        try {{
-          const response = await fetch("/api/watchlist", {{
-            method: "POST",
-            headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{ symbol }}),
-          }});
-          if (!response.ok) {{
-            const data = await response.json().catch(() => ({{}}));
-            alert(data.detail || "加入失败，请检查代码格式");
-            return;
-          }}
-          input.value = "";
-          location.reload();
-        }} catch (_) {{
-          alert("网络异常，稍后再试");
-        }}
-      }});
-    }}
 
-    document.querySelectorAll("[data-remove-symbol]").forEach((button) => {{
-      button.addEventListener("click", async () => {{
-        const symbol = button.dataset.removeSymbol;
-        if (!symbol) return;
-        try {{
-          const response = await fetch(`/api/watchlist/${{encodeURIComponent(symbol)}}`, {{
-            method: "DELETE",
-          }});
-          if (!response.ok) {{
-            const data = await response.json().catch(() => ({{}}));
-            alert(data.detail || "移除失败，请稍后再试");
-            return;
-          }}
-          location.reload();
-        }} catch (_) {{
-          alert("网络异常，稍后再试");
-        }}
-      }});
-    }});
-
-    const movementSettingsForm = document.getElementById("movement-settings-form");
-    if (movementSettingsForm) {{
-      movementSettingsForm.addEventListener("submit", async (event) => {{
-        event.preventDefault();
-        const readThresholds = (prefix) => [1, 2, 3].map((tier) => Number.parseFloat(document.getElementById(`${{prefix}}-tier${{tier}}-pct`).value));
-        const fast_drop = readThresholds("drop");
-        const fast_rise = readThresholds("rise");
-        try {{
-          const response = await fetch("/api/movement-alert-settings", {{
-            method: "POST",
-            headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{ fast_drop, fast_rise }}),
-          }});
-          if (!response.ok) {{
-            const data = await response.json().catch(() => ({{}}));
-            alert(data.detail || "保存失败，请检查三档阈值是否递增");
-            return;
-          }}
-          location.reload();
-        }} catch (_) {{
-          alert("网络异常，稍后再试");
-        }}
-      }});
-    }}
-
-    const tabs = Array.from(document.querySelectorAll(".mobile-tab"));
-    const panels = Array.from(document.querySelectorAll("[data-panel]"));
-    const activateTab = (target) => {{
-      tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tabTarget === target));
-      panels.forEach((panel) => panel.classList.toggle("active-panel", panel.dataset.panel === target));
-      if (target === "settings") {{
-        const drawer = document.querySelector(".settings-drawer");
-        if (drawer) drawer.open = true;
-      }}
-    }};
-    tabs.forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tabTarget)));
-  </script>
-</body>
-</html>
-"""
+def _render_dashboard_template(values: dict[str, str]) -> str:
+    template = Template(DASHBOARD_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    return template.safe_substitute(values)
 
 
 def _render_symbol_card(item: dict) -> str:
