@@ -102,7 +102,7 @@ def test_run_once_trace_wraps_cycle_and_children(monkeypatch, tmp_path):
     monkeypatch.setattr("gemini_stock.main.Database", FakeDatabase)
     monkeypatch.setattr(
         "gemini_stock.main.run_symbol",
-        lambda symbol, settings, db, rules, profile="primary", context=None: symbol_runs.append(f"{profile}:{symbol}") or None,
+        lambda symbol, settings, db, rules, profile="primary", context=None, allow_ai=True: symbol_runs.append(f"{profile}:{symbol}:{allow_ai}") or None,
     )
     monkeypatch.setattr(
         "gemini_stock.main.run_movement_only_once",
@@ -130,7 +130,7 @@ def test_run_once_trace_wraps_cycle_and_children(monkeypatch, tmp_path):
         data_provider="yfinance",
     )
 
-    run_once(settings)
+    run_once(settings, now=datetime(2026, 1, 5, 17, 0, tzinfo=timezone.utc))
 
     span_names = [span.name for span in tracer.spans]
     assert "worker.run_once" in span_names
@@ -141,8 +141,42 @@ def test_run_once_trace_wraps_cycle_and_children(monkeypatch, tmp_path):
     assert root_span.tags["llm_provider"] == "openai"
     assert root_span.tags["symbol_count"] == 1
     assert root_span.tags["benchmark_symbol_count"] == 1
-    assert symbol_runs == ["primary:TSLL", "benchmark:SPY"]
+    assert symbol_runs == ["primary:TSLL:False", "benchmark:SPY:False"]
     assert helper_calls == ["movement", "premarket", "maintenance", "self_check"]
+
+
+def test_run_once_enables_ai_only_during_opening_two_hours(monkeypatch, tmp_path):
+    class FakeDatabase:
+        def __init__(self, path):
+            self.path = path
+
+        def initialize(self):
+            return None
+
+        def list_watch_symbols(self, profile: str):
+            return []
+
+    symbol_runs: list[str] = []
+    monkeypatch.setattr("gemini_stock.main.Database", FakeDatabase)
+    monkeypatch.setattr(
+        "gemini_stock.main.run_symbol",
+        lambda symbol, settings, db, rules, profile="primary", context=None, allow_ai=True: symbol_runs.append(f"{profile}:{symbol}:{allow_ai}") or None,
+    )
+    monkeypatch.setattr("gemini_stock.main.run_movement_only_once", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_premarket_brief", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.run_maintenance_tasks", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_opening_silence_self_check", lambda *args, **kwargs: False)
+
+    settings = Settings(
+        database_path=tmp_path / "signals.db",
+        chart_dir=tmp_path,
+        symbols=["TSLL"],
+        benchmark_symbols=["SPY"],
+    )
+
+    run_once(settings, now=datetime(2026, 1, 5, 15, 30, tzinfo=timezone.utc))
+
+    assert symbol_runs == ["primary:TSLL:True", "benchmark:SPY:True"]
 
 
 def test_run_symbol_trace_sets_symbol_tags(monkeypatch, tmp_path):

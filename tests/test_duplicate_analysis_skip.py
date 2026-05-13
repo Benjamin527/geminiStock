@@ -4,6 +4,8 @@ import pandas as pd
 
 from gemini_stock.config import Settings
 from gemini_stock.features.snapshot import build_technical_snapshot
+from types import SimpleNamespace
+
 from gemini_stock.main import RuntimeContext, run_symbol
 from gemini_stock.rules.alert_rules import AlertRuleEngine
 from gemini_stock.schemas import GeminiSignal
@@ -63,9 +65,6 @@ def test_run_symbol_reuses_existing_signal_for_same_15m_snapshot(monkeypatch, tm
     )
 
     class FakeProvider:
-        def __init__(self, delayed_tolerance_minutes):
-            pass
-
         def get_ohlcv(self, symbol, interval, period):
             return candles_1m if interval == "1m" else candles_15m
 
@@ -77,10 +76,13 @@ def test_run_symbol_reuses_existing_signal_for_same_15m_snapshot(monkeypatch, tm
             return signal
 
     analyzer = FakeAnalyzer()
-    monkeypatch.setattr("gemini_stock.main.YFinanceMarketDataProvider", FakeProvider)
-    monkeypatch.setattr("gemini_stock.main.create_analyzer", lambda settings: analyzer)
-    context = RuntimeContext.from_settings(
-        Settings(database_path=tmp_path / "signals.db", chart_dir=tmp_path, feishu_webhook_url=None)
+    context = RuntimeContext(
+        data_provider=FakeProvider(),
+        news_provider=SimpleNamespace(get_news=lambda symbols: []),
+        renderer=SimpleNamespace(render_simplified=lambda *args, **kwargs: tmp_path / "chart.png"),
+        analyzer=analyzer,
+        fallback_analyzer=SimpleNamespace(analyze_json_only=lambda analysis_input: signal),
+        notifiers=[],
     )
 
     result = run_symbol(

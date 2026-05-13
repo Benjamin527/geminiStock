@@ -53,6 +53,13 @@ def get_schedule_decision(now: datetime | None = None) -> ScheduleDecision:
     return ScheduleDecision(False, session, seconds_until_next_session(now))
 
 
+def ai_analysis_window_open(now: datetime | None = None) -> bool:
+    current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
+    if classify_market_session(current) != MarketSession.REGULAR:
+        return False
+    return time(9, 30) <= current.time() < time(11, 30)
+
+
 def seconds_until_next_session(now: datetime | None = None) -> int:
     current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
     next_starts = [_next_premarket_start(current), _next_overnight_start(current)]

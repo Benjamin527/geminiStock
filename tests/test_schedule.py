@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from gemini_stock.schedule import MarketSession, get_schedule_decision
+from gemini_stock.schedule import MarketSession, ai_analysis_window_open, get_schedule_decision
 
 
 def _utc(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -86,3 +86,23 @@ def test_weekend_daytime_market_does_not_run():
     assert decision.should_run is False
     assert decision.session == MarketSession.CLOSED
     assert decision.interval_seconds > 0
+
+
+def test_ai_analysis_window_open_during_regular_opening_hours_in_winter():
+    # 2026-01-05 15:30 UTC = 10:30 New York
+    assert ai_analysis_window_open(_utc(2026, 1, 5, 15, 30)) is True
+
+
+def test_ai_analysis_window_closed_after_opening_hours_in_winter():
+    # 2026-01-05 17:00 UTC = 12:00 New York
+    assert ai_analysis_window_open(_utc(2026, 1, 5, 17, 0)) is False
+
+
+def test_ai_analysis_window_open_during_regular_opening_hours_in_summer():
+    # 2026-07-06 14:30 UTC = 10:30 New York
+    assert ai_analysis_window_open(_utc(2026, 7, 6, 14, 30)) is True
+
+
+def test_ai_analysis_window_closed_in_premarket_even_if_beijing_is_evening():
+    # 2026-07-06 12:30 UTC = 08:30 New York
+    assert ai_analysis_window_open(_utc(2026, 7, 6, 12, 30)) is False

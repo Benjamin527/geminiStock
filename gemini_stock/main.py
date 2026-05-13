@@ -45,7 +45,7 @@ from gemini_stock.replay import build_daily_review, format_daily_review
 from gemini_stock.rules.alert_rules import AlertRuleEngine, BenchmarkAlertRuleEngine
 from gemini_stock.rules.movement_alerts import build_movement_alert_card, build_movement_alerts, format_movement_alert
 from gemini_stock.rules.price_action_alerts import build_price_action_alerts, build_price_action_card, format_price_action_alert
-from gemini_stock.schedule import MarketSession, get_schedule_decision
+from gemini_stock.schedule import MarketSession, ai_analysis_window_open, get_schedule_decision
 from gemini_stock.storage.db import Database
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ class SymbolRunResult:
     symbol: str
     profile: str
     snapshot: object
-    signal: object
+    signal: object | None
     candles_1m: pd.DataFrame
 
 
@@ -146,6 +146,7 @@ def run_symbol(
     rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
     profile: str = "primary",
     context: RuntimeContext | None = None,
+    allow_ai: bool = True,
 ) -> SymbolRunResult | None:
     runtime = context or RuntimeContext.from_settings(settings)
     with _trace_span("worker.run_symbol", symbol=symbol, profile=profile):
@@ -162,6 +163,9 @@ def run_symbol(
             latest_timestamp = pd.Timestamp(candles_1m.sort_values("timestamp").iloc[-1]["timestamp"]).to_pydatetime()
             trading_date = latest_timestamp.astimezone(NEW_YORK).date().isoformat()
             maybe_send_movement_alerts(settings, db, snapshot, candles_1m, profile=profile, trading_date=trading_date)
+        if not allow_ai:
+            logger.info("llm_analysis_skipped_outside_window", extra={"symbol": symbol, "profile": profile})
+            return SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=None, candles_1m=candles_1m)
         existing_signal = db.get_successful_signal_for_snapshot(symbol, snapshot.timestamp_utc)
         if existing_signal is not None:
             logger.info("llm_analysis_skipped_same_snapshot", extra={"symbol": symbol, "snapshot_timestamp": snapshot.timestamp_utc.isoformat()})
@@ -256,25 +260,27 @@ def run_symbol(
         return result
 
 
-def run_once(settings: Settings) -> None:
+def run_once(settings: Settings, now: datetime | None = None) -> None:
     db = Database(settings.database_path)
     db.initialize()
     primary_symbols = db.list_watch_symbols("primary") or settings.symbols
     benchmark_symbols = db.list_watch_symbols("benchmark") or settings.benchmark_symbols
     context = RuntimeContext.from_settings(settings)
+    ai_enabled = ai_analysis_window_open(now)
     with _trace_span(
         "worker.run_once",
         data_provider=settings.data_provider,
         llm_provider=settings.llm_provider,
         symbol_count=len(primary_symbols),
         benchmark_symbol_count=len(benchmark_symbols),
+        ai_enabled=ai_enabled,
     ):
         primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
         benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
         benchmark_results: list[SymbolRunResult] = []
         for symbol in primary_symbols:
             try:
-                run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context)
+                run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context, allow_ai=ai_enabled)
             except MarketDataError as exc:
                 db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
                 logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
@@ -282,8 +288,8 @@ def run_once(settings: Settings) -> None:
                 logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
         for symbol in benchmark_symbols:
             try:
-                result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context)
-                if result is not None:
+                result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context, allow_ai=ai_enabled)
+                if result is not None and result.signal is not None:
                     benchmark_results.append(result)
             except MarketDataError as exc:
                 db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
