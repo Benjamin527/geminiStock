@@ -96,17 +96,6 @@ def create_app(
             "watchlist": watchlist,
             "movement_alert_settings": movement_alert_settings,
             "priority_views": priority_views,
-            "fragments": build_dashboard_fragments(
-                status=status,
-                metrics=metrics,
-                symbols=symbol_states,
-                benchmarks=benchmark_states,
-                llm_outputs=llm_outputs,
-                alerts=alerts,
-                errors=errors,
-                watchlist=watchlist,
-                priority_views=priority_views,
-            ),
         }
 
     @app.get("/", response_class=HTMLResponse)
@@ -123,7 +112,6 @@ def create_app(
             watchlist=payload["watchlist"],
             movement_alert_settings=payload["movement_alert_settings"],
             priority_views=payload["priority_views"],
-            fragments=payload["fragments"],
         )
 
     @app.get("/api/status")
@@ -332,7 +320,7 @@ def _price_in_zone(price, zone) -> bool:
     return low <= float(price) <= high
 
 
-def build_dashboard_fragments(
+def _build_dashboard_template_values(
     status: dict,
     metrics: dict,
     symbols: list[dict],
@@ -341,6 +329,7 @@ def build_dashboard_fragments(
     alerts: list[dict],
     errors: list[dict],
     watchlist: dict[str, list[str]],
+    movement_alert_settings: dict,
     priority_views: dict[str, list[dict]] | None = None,
 ) -> dict[str, str]:
     ordered_symbols = sorted(symbols, key=_symbol_sort_key)
@@ -409,31 +398,49 @@ def build_dashboard_fragments(
         """
         for title, items in priority_sections
     )
+    primary_watch_items = "".join(
+        f"""
+        <div class="watch-chip">
+          <span class="watch-badge">{symbol}</span>
+          <button class="watch-remove" type="button" data-remove-symbol="{symbol}" aria-label="移除 {symbol}">移除</button>
+        </div>
+        """
+        for symbol in watchlist.get("primary", [])
+    ) or "<span class='watch-badge'>暂无</span>"
+    drop_thresholds = movement_alert_settings.get("fast_drop") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
+    rise_thresholds = movement_alert_settings.get("fast_rise") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
     return {
-        "top_status": (
+        "TOP_STATUS": (
             f'<div class="metric primary"><span>距离下次执行</span><b id="next-run-countdown" data-seconds="{int(status.get("countdown_seconds") or 0)}">{status["countdown_label"]}</b></div>'
             f'<div class="metric"><span>市场阶段</span><b>{_label(status["market_session"])}</b></div>'
             f'<div class="metric"><span>今日报警 / 错误</span><b>{metrics["alerts_today"]} / {metrics["llm_errors_today"]}</b></div>'
             f'<div class="metric"><span>后台状态</span><b>{worker_state}</b></div>'
         ),
-        "priority_cards": priority_cards,
-        "config_warning": f"配置提醒：本地 .env 含敏感字段 {warning_text}，建议轮换并移入密钥管理。" if warning_text else "",
-        "symbol_cards": symbol_cards,
-        "benchmark_cards": benchmark_cards,
-        "metric_cards": metric_cards,
-        "cost_panel": (
+        "PRIORITY_CARDS": priority_cards,
+        "CONFIG_WARNING": f"配置提醒：本地 .env 含敏感字段 {warning_text}，建议轮换并移入密钥管理。" if warning_text else "",
+        "WATCH_PRIMARY": " · ".join(watchlist.get("primary") or []) or "-",
+        "WATCH_BENCHMARK": " · ".join(watchlist.get("benchmark") or []) or "-",
+        "PRIMARY_WATCH_ITEMS": primary_watch_items,
+        "DROP_TIER_1": str(drop_thresholds[0]),
+        "DROP_TIER_2": str(drop_thresholds[1]),
+        "DROP_TIER_3": str(drop_thresholds[2]),
+        "RISE_TIER_1": str(rise_thresholds[0]),
+        "RISE_TIER_2": str(rise_thresholds[1]),
+        "RISE_TIER_3": str(rise_thresholds[2]),
+        "SYMBOL_CARDS": symbol_cards,
+        "BENCHMARK_CARDS": benchmark_cards,
+        "METRIC_CARDS": metric_cards,
+        "COST_PANEL": (
             '<h2>AI 调用成本代理</h2>'
             f'<div class="bar" aria-label="JSON 与图像调用比例" style="grid-template-columns: {json_pct}fr {image_pct}fr;"><i></i><i></i></div>'
             f'<div class="legend"><span>JSON-only {json_count} 次</span><span>传图 {image_count} 次</span></div>'
             "<p class=\"sub\">日常扫描优先 JSON，强候选才进入图像复核。</p>"
         ),
-        "llm_rows": llm_rows,
-        "llm_mobile_cards": llm_mobile_cards,
-        "error_items": error_items,
-        "alert_rows": alert_rows,
-        "alert_mobile_cards": alert_mobile_cards,
-        "watch_primary": " · ".join(watchlist.get("primary") or []) or "-",
-        "watch_benchmark": " · ".join(watchlist.get("benchmark") or []) or "-",
+        "LLM_ROWS": llm_rows,
+        "LLM_MOBILE_CARDS": llm_mobile_cards,
+        "ERROR_ITEMS": error_items,
+        "ALERT_ROWS": alert_rows,
+        "ALERT_MOBILE_CARDS": alert_mobile_cards,
     }
 
 
@@ -448,9 +455,8 @@ def render_dashboard(
     watchlist: dict[str, list[str]],
     movement_alert_settings: dict,
     priority_views: dict[str, list[dict]] | None = None,
-    fragments: dict[str, str] | None = None,
 ) -> str:
-    fragments = fragments or build_dashboard_fragments(
+    values = _build_dashboard_template_values(
         status=status,
         metrics=metrics,
         symbols=symbols,
@@ -459,44 +465,10 @@ def render_dashboard(
         alerts=alerts,
         errors=errors,
         watchlist=watchlist,
+        movement_alert_settings=movement_alert_settings,
         priority_views=priority_views,
     )
-    primary_watch_items = "".join(
-        f"""
-        <div class="watch-chip">
-          <span class="watch-badge">{symbol}</span>
-          <button class="watch-remove" type="button" data-remove-symbol="{symbol}" aria-label="移除 {symbol}">移除</button>
-        </div>
-        """
-        for symbol in watchlist.get("primary", [])
-    ) or "<span class='watch-badge'>暂无</span>"
-    drop_thresholds = movement_alert_settings.get("fast_drop") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
-    rise_thresholds = movement_alert_settings.get("fast_rise") or movement_alert_settings.get("threshold_pcts") or DEFAULT_MOVEMENT_ALERT_THRESHOLD_PCTS
-    return _render_dashboard_template(
-        {
-            "TOP_STATUS": fragments["top_status"],
-            "PRIORITY_CARDS": fragments["priority_cards"],
-            "CONFIG_WARNING": fragments["config_warning"],
-            "WATCH_PRIMARY": fragments["watch_primary"],
-            "WATCH_BENCHMARK": fragments["watch_benchmark"],
-            "PRIMARY_WATCH_ITEMS": primary_watch_items,
-            "DROP_TIER_1": str(drop_thresholds[0]),
-            "DROP_TIER_2": str(drop_thresholds[1]),
-            "DROP_TIER_3": str(drop_thresholds[2]),
-            "RISE_TIER_1": str(rise_thresholds[0]),
-            "RISE_TIER_2": str(rise_thresholds[1]),
-            "RISE_TIER_3": str(rise_thresholds[2]),
-            "SYMBOL_CARDS": fragments["symbol_cards"],
-            "BENCHMARK_CARDS": fragments["benchmark_cards"],
-            "METRIC_CARDS": fragments["metric_cards"],
-            "COST_PANEL": fragments["cost_panel"],
-            "LLM_ROWS": fragments["llm_rows"],
-            "LLM_MOBILE_CARDS": fragments["llm_mobile_cards"],
-            "ERROR_ITEMS": fragments["error_items"],
-            "ALERT_ROWS": fragments["alert_rows"],
-            "ALERT_MOBILE_CARDS": fragments["alert_mobile_cards"],
-        }
-    )
+    return _render_dashboard_template(values)
 
 
 def _render_dashboard_template(values: dict[str, str]) -> str:

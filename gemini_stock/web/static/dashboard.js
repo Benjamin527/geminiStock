@@ -1,7 +1,5 @@
 let countdownEl = null;
 let remainingSeconds = 0;
-let refreshInFlight = false;
-const statusEndpoint = document.body.dataset.statusEndpoint || "/api/status";
 
 const formatCountdown = (seconds) => {
   if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -27,66 +25,21 @@ const bindCountdown = () => {
   }
 };
 
-const replaceHtml = (id, html) => {
-  const element = document.getElementById(id);
-  if (element && typeof html === "string") {
-    element.innerHTML = html;
+const shouldDelayAutoRefresh = () => {
+  if (document.visibilityState !== "visible") {
+    return true;
   }
+
+  const activeTag = document.activeElement?.tagName || "";
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(activeTag);
 };
 
-const applyDashboardPayload = (payload) => {
-  const fragments = payload?.fragments || {};
-  replaceHtml("top-status", fragments.top_status);
-  replaceHtml("priority-board", fragments.priority_cards);
-  replaceHtml("symbol-cards", fragments.symbol_cards);
-  replaceHtml("benchmark-cards", fragments.benchmark_cards);
-  replaceHtml("metric-cards", fragments.metric_cards);
-  replaceHtml("cost-panel", fragments.cost_panel);
-  replaceHtml("llm-rows", fragments.llm_rows);
-  replaceHtml("llm-mobile-cards", fragments.llm_mobile_cards);
-  replaceHtml("error-items", fragments.error_items);
-  replaceHtml("alert-rows", fragments.alert_rows);
-  replaceHtml("alert-mobile-cards", fragments.alert_mobile_cards);
-
-  const warning = document.getElementById("config-warning");
-  if (warning && typeof fragments.config_warning === "string") {
-    warning.textContent = fragments.config_warning;
-  }
-
-  const watchPrimary = document.getElementById("watch-primary-summary");
-  if (watchPrimary && typeof fragments.watch_primary === "string") {
-    watchPrimary.textContent = `主监控：${fragments.watch_primary}`;
-  }
-
-  const watchBenchmark = document.getElementById("watch-benchmark-summary");
-  if (watchBenchmark && typeof fragments.watch_benchmark === "string") {
-    watchBenchmark.textContent = `参考监控：${fragments.watch_benchmark}`;
-  }
-
-  bindCountdown();
-  bindWatchRemovals();
-};
-
-const refreshDashboard = async () => {
-  if (refreshInFlight) {
+const refreshDashboard = () => {
+  if (shouldDelayAutoRefresh()) {
     return;
   }
 
-  refreshInFlight = true;
-  try {
-    const response = await fetch(statusEndpoint, {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      return;
-    }
-    applyDashboardPayload(await response.json());
-  } catch (_) {
-    // Keep the current view visible if refresh fails.
-  } finally {
-    refreshInFlight = false;
-  }
+  window.location.reload();
 };
 
 const bindWatchForm = () => {

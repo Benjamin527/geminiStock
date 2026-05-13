@@ -277,9 +277,9 @@ def test_dashboard_page_uses_coinbase_template_assets(tmp_path, monkeypatch):
     assert "Institutional watch for leveraged AI setups" in response.text
     assert "监控与阈值设置" in response.text
     assert '<meta http-equiv="refresh"' not in response.text
-    assert "/api/status" in response.text
     assert '<script src="/static/dashboard.js"></script>' in response.text
     assert 'id="dashboard-root"' in response.text
+    assert 'data-status-endpoint=' not in response.text
 
 
 def test_dashboard_benchmark_cards_show_regular_session_forecast(tmp_path, monkeypatch):
@@ -450,6 +450,7 @@ def test_dashboard_api_status_includes_priority_views(tmp_path, monkeypatch):
     payload = TestClient(app).get("/api/status").json()
 
     assert "priority_views" in payload
+    assert "fragments" not in payload
     assert payload["priority_views"]["most_urgent"][0]["symbol"] == "HIGH"
     assert payload["priority_views"]["most_actionable"][0]["symbol"] == "HIGH"
     assert "AI 已触发提醒" in payload["priority_views"]["most_urgent"][0]["explanation"]
