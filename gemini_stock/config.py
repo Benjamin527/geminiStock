@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     market_data_timeout_seconds: int = 20
     worker_stale_after_intervals: float = 2.5
     max_scheduler_sleep_seconds: int = 300
+    worker_max_concurrency: int = 4
 
     run_once: bool = False
 

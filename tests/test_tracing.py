@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,6 +179,94 @@ def test_run_once_enables_ai_only_during_opening_two_hours(monkeypatch, tmp_path
     run_once(settings, now=datetime(2026, 1, 5, 15, 30, tzinfo=timezone.utc))
 
     assert symbol_runs == ["primary:TSLL:True", "benchmark:SPY:True"]
+
+
+def test_run_once_processes_symbols_with_bounded_concurrency(monkeypatch, tmp_path):
+    class FakeDatabase:
+        def __init__(self, path):
+            self.path = path
+
+        def initialize(self):
+            return None
+
+        def list_watch_symbols(self, profile: str):
+            return []
+
+    calls: list[tuple[str, int]] = []
+    thread_ids: set[int] = set()
+
+    def fake_run_symbol(symbol, settings, db, rules, profile="primary", context=None, allow_ai=True):
+        thread_ids.add(threading.get_ident())
+        calls.append((f"{profile}:{symbol}", threading.get_ident()))
+        time.sleep(0.15)
+        return None
+
+    monkeypatch.setattr("gemini_stock.main.Database", FakeDatabase)
+    monkeypatch.setattr("gemini_stock.main.run_symbol", fake_run_symbol)
+    monkeypatch.setattr("gemini_stock.main.run_movement_only_once", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_premarket_brief", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.run_maintenance_tasks", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_opening_silence_self_check", lambda *args, **kwargs: False)
+
+    settings = Settings(
+        database_path=tmp_path / "signals.db",
+        chart_dir=tmp_path,
+        symbols=["TSLL", "CONL"],
+        benchmark_symbols=["SPY"],
+    )
+
+    started_at = time.perf_counter()
+    run_once(settings, now=datetime(2026, 1, 5, 15, 30, tzinfo=timezone.utc))
+    elapsed = time.perf_counter() - started_at
+
+    assert {name for name, _ in calls} == {"primary:TSLL", "primary:CONL", "benchmark:SPY"}
+    assert len(thread_ids) >= 2
+    assert elapsed < 0.40
+
+
+def test_run_once_reuses_single_runtime_context_across_concurrent_symbols(monkeypatch, tmp_path):
+    class FakeDatabase:
+        def __init__(self, path):
+            self.path = path
+
+        def initialize(self):
+            return None
+
+        def list_watch_symbols(self, profile: str):
+            return []
+
+    runtime_context = SimpleNamespace(name="shared-runtime")
+    created_contexts: list[object] = []
+    seen_context_ids: list[int] = []
+
+    def fake_from_settings(settings):
+        created_contexts.append(runtime_context)
+        return runtime_context
+
+    def fake_run_symbol(symbol, settings, db, rules, profile="primary", context=None, allow_ai=True):
+        seen_context_ids.append(id(context))
+        time.sleep(0.05)
+        return None
+
+    monkeypatch.setattr("gemini_stock.main.Database", FakeDatabase)
+    monkeypatch.setattr("gemini_stock.main.RuntimeContext.from_settings", fake_from_settings)
+    monkeypatch.setattr("gemini_stock.main.run_symbol", fake_run_symbol)
+    monkeypatch.setattr("gemini_stock.main.run_movement_only_once", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_premarket_brief", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.run_maintenance_tasks", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gemini_stock.main.maybe_send_opening_silence_self_check", lambda *args, **kwargs: False)
+
+    settings = Settings(
+        database_path=tmp_path / "signals.db",
+        chart_dir=tmp_path,
+        symbols=["TSLL", "CONL"],
+        benchmark_symbols=["SPY"],
+    )
+
+    run_once(settings, now=datetime(2026, 1, 5, 15, 30, tzinfo=timezone.utc))
+
+    assert len(created_contexts) == 1
+    assert seen_context_ids == [id(runtime_context), id(runtime_context), id(runtime_context)]
 
 
 def test_run_symbol_trace_sets_symbol_tags(monkeypatch, tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timezone
@@ -278,30 +279,89 @@ def run_once(settings: Settings, now: datetime | None = None) -> None:
         primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
         benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
         benchmark_results: list[SymbolRunResult] = []
-        for symbol in primary_symbols:
-            try:
-                run_symbol(symbol, settings, db, primary_rules, profile="primary", context=context, allow_ai=ai_enabled)
-            except MarketDataError as exc:
-                db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
-                logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
-            except Exception as exc:
-                logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
-        for symbol in benchmark_symbols:
-            try:
-                result = run_symbol(symbol, settings, db, benchmark_rules, profile="benchmark", context=context, allow_ai=ai_enabled)
-                if result is not None and result.signal is not None:
-                    benchmark_results.append(result)
-            except MarketDataError as exc:
-                db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
-                logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
-            except Exception as exc:
-                logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
+        _run_symbol_batch(
+            primary_symbols,
+            settings,
+            db,
+            primary_rules,
+            profile="primary",
+            context=context,
+            allow_ai=ai_enabled,
+        )
+        benchmark_results.extend(
+            result
+            for result in _run_symbol_batch(
+                benchmark_symbols,
+                settings,
+                db,
+                benchmark_rules,
+                profile="benchmark",
+                context=context,
+                allow_ai=ai_enabled,
+            )
+            if result is not None and result.signal is not None
+        )
         with _trace_span("worker.run_movement_only"):
             run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
         maybe_send_premarket_brief(settings, db, benchmark_results)
         with _trace_span("worker.maintenance"):
             run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
         maybe_send_opening_silence_self_check(settings, db, primary_symbols)
+
+
+def _run_symbol_batch(
+    symbols: list[str],
+    settings: Settings,
+    db: Database,
+    rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
+    profile: str,
+    context: RuntimeContext,
+    allow_ai: bool,
+) -> list[SymbolRunResult | None]:
+    if not symbols:
+        return []
+
+    max_workers = max(1, min(settings.worker_max_concurrency, len(symbols)))
+    if max_workers == 1:
+        return [_run_symbol_task(symbol, settings, db, rules, profile, context, allow_ai) for symbol in symbols]
+
+    results_by_symbol: dict[str, SymbolRunResult | None] = {}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{profile}-worker") as executor:
+        futures = {
+            executor.submit(_run_symbol_task, symbol, settings, db, rules, profile, context, allow_ai): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            results_by_symbol[symbol] = future.result()
+    return [results_by_symbol.get(symbol) for symbol in symbols]
+
+
+def _run_symbol_task(
+    symbol: str,
+    settings: Settings,
+    db: Database,
+    rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
+    profile: str,
+    context: RuntimeContext,
+    allow_ai: bool,
+) -> SymbolRunResult | None:
+    try:
+        return run_symbol(
+            symbol,
+            settings,
+            db,
+            rules,
+            profile=profile,
+            context=context,
+            allow_ai=allow_ai,
+        )
+    except MarketDataError as exc:
+        db.save_llm_output(symbol, {"analysis_level": "market_data", "symbol": symbol}, None, str(exc))
+        logger.error("market_data_failed", extra={"symbol": symbol, "error": str(exc)})
+    except Exception as exc:
+        logger.exception("symbol_run_failed", extra={"symbol": symbol, "error": str(exc)})
+    return None
 
 
 def run_movement_only_once(

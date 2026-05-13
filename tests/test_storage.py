@@ -152,3 +152,15 @@ def test_database_watchlist_can_disable_existing_symbol(tmp_path):
 
     assert removed is True
     assert db.list_watch_symbols("primary") == []
+
+
+def test_database_connect_enables_wal_and_busy_timeout(tmp_path):
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+
+    with db.connect() as conn:
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert str(journal_mode).lower() == "wal"
+    assert int(busy_timeout) >= 5000

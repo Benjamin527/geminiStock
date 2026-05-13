@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -26,8 +26,10 @@ class DashboardRepository:
         self.chart_dir = Path(chart_dir)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.database_path)
+        conn = sqlite3.connect(self.database_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def get_status(self) -> dict[str, Any]:
@@ -361,10 +363,17 @@ class DashboardRepository:
         if table not in {"features", "llm_outputs", "alerts"}:
             raise ValueError(f"unsupported table: {table}")
         selected = ", ".join(columns)
+        start_utc, end_utc = _today_utc_range_for_beijing()
         with self.connect() as conn:
-            rows = conn.execute(f"SELECT {selected} FROM {table}").fetchall()
-        today = datetime.now(BEIJING).date()
-        return [row for row in rows if _parse_datetime(row["created_at_utc"]).astimezone(BEIJING).date() == today]
+            rows = conn.execute(
+                f"""
+                SELECT {selected}
+                FROM {table}
+                WHERE created_at_utc >= ? AND created_at_utc < ?
+                """,
+                (start_utc, end_utc),
+            ).fetchall()
+        return list(rows)
 
     @staticmethod
     def _seconds_until_next_run(latest_created_at: str | None, interval_seconds: int, should_run: bool) -> int:
@@ -390,6 +399,16 @@ class DashboardRepository:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _today_utc_range_for_beijing(now: datetime | None = None) -> tuple[str, str]:
+    current = (now or datetime.now(BEIJING)).astimezone(BEIJING)
+    start_beijing = datetime.combine(current.date(), datetime.min.time(), tzinfo=BEIJING)
+    end_beijing = start_beijing + timedelta(days=1)
+    return (
+        start_beijing.astimezone(timezone.utc).isoformat(),
+        end_beijing.astimezone(timezone.utc).isoformat(),
+    )
 
 
 def to_beijing_time(value: str | None) -> str | None:
