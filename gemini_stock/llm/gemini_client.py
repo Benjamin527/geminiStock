@@ -76,6 +76,17 @@ class RuleBasedFallbackAnalyzer:
         if rsi is not None and rsi < 35 and analysis_input.last_price >= (analysis_input.ema_50 or analysis_input.last_price) - 2 * (analysis_input.atr_14 or 0):
             score = 7.2
             bias = "bullish"
+        l1 = min((bar.low for bar in analysis_input.ohlcv_recent[-8:]), default=analysis_input.last_price)
+        reasons = [
+            "本地兜底只给观察框架：先判断模式是否切换，再记录 L1，优先等待二次握手。",
+        ]
+        if analysis_input.trend_regime == "bearish":
+            reasons.append("当前更像单边下跌环境，盘中小 V 先按日内 T 看，不直接当成波段修复。")
+        risk_warnings = [
+            "LLM 不可用，本轮不能给出完整事件、板块、夜盘和期权确认，只保留条件式观察。",
+            f"若后续有效跌破 L1 参考位 {l1:.2f} 或尾盘继续走弱，默认不抢早、不加仓。",
+            "高波动标的即使放宽价位区间，也要同步降低仓位；缺少二次握手前不转成重仓观点。",
+        ]
         return GeminiSignal(
             symbol=analysis_input.symbol,
             timestamp_utc=analysis_input.timestamp_utc,
@@ -93,8 +104,8 @@ class RuleBasedFallbackAnalyzer:
                 analysis_input.last_price + 2.5 * (analysis_input.atr_14 or 0),
             ],
             risk_reward_ratio=0.0,
-            reasons=["Offline fallback generated a conservative watch-only signal from Python indicators."],
-            risk_warnings=["LLM analysis was unavailable, so this fallback cannot trigger trade alerts."],
+            reasons=reasons,
+            risk_warnings=risk_warnings,
         )
 
     def review_multimodal(

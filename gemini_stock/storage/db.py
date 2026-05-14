@@ -417,6 +417,22 @@ class Database:
             ).fetchone()
         return str(row["created_at_utc"]) if row and row["created_at_utc"] else None
 
+    def get_latest_worker_activity_time(self) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(created_at_utc) AS latest_at
+                FROM (
+                    SELECT created_at_utc FROM features
+                    UNION ALL
+                    SELECT created_at_utc FROM llm_outputs
+                    UNION ALL
+                    SELECT created_at_utc FROM alerts
+                )
+                """
+            ).fetchone()
+        return str(row["latest_at"]) if row and row["latest_at"] else None
+
     def get_latest_candle_time(self, symbol: str, interval: str) -> datetime | None:
         with self.connect() as conn:
             row = conn.execute(

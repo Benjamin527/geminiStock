@@ -16,31 +16,31 @@ def test_regular_market_first_ninety_minutes_run_every_minute():
     assert decision.interval_seconds == 60
 
 
-def test_regular_market_at_ninety_minute_boundary_runs_every_thirty_minutes():
-    # 2026-01-05 16:00 UTC = 11:00 New York
-    decision = get_schedule_decision(_utc(2026, 1, 5, 16, 0))
+def test_regular_market_at_ninety_minute_boundary_runs_every_five_minutes_before_beijing_quiet_hours():
+    # 2026-07-06 15:00 UTC = 11:00 New York = 23:00 Beijing
+    decision = get_schedule_decision(_utc(2026, 7, 6, 15, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
     assert decision.interval_seconds == 5 * 60
 
 
-def test_regular_market_midday_runs_every_ten_minutes():
+def test_regular_market_midday_drops_to_thirty_minutes_during_beijing_quiet_hours():
     # 2026-01-05 17:00 UTC = 12:00 New York
     decision = get_schedule_decision(_utc(2026, 1, 5, 17, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
-    assert decision.interval_seconds == 10 * 60
+    assert decision.interval_seconds == 30 * 60
 
 
-def test_regular_market_near_close_runs_every_two_minutes():
+def test_regular_market_near_close_drops_to_thirty_minutes_during_beijing_quiet_hours():
     # 2026-01-05 20:00 UTC = 15:00 New York
     decision = get_schedule_decision(_utc(2026, 1, 5, 20, 0))
 
     assert decision.should_run is True
     assert decision.session == MarketSession.REGULAR
-    assert decision.interval_seconds == 2 * 60
+    assert decision.interval_seconds == 30 * 60
 
 
 def test_premarket_runs_every_five_minutes():
@@ -77,6 +77,33 @@ def test_overnight_runs_every_five_minutes_before_premarket():
     assert decision.should_run is True
     assert decision.session == MarketSession.OVERNIGHT
     assert decision.interval_seconds == 5 * 60
+
+
+def test_regular_market_drops_to_thirty_minutes_during_beijing_quiet_hours():
+    # 2026-01-05 15:45 UTC = 10:45 New York = 23:45 Beijing
+    decision = get_schedule_decision(_utc(2026, 1, 5, 15, 45))
+
+    assert decision.should_run is True
+    assert decision.session == MarketSession.REGULAR
+    assert decision.interval_seconds == 30 * 60
+
+
+def test_regular_market_keeps_fast_frequency_before_beijing_quiet_hours():
+    # 2026-01-05 15:25 UTC = 10:25 New York = 23:25 Beijing
+    decision = get_schedule_decision(_utc(2026, 1, 5, 15, 25))
+
+    assert decision.should_run is True
+    assert decision.session == MarketSession.REGULAR
+    assert decision.interval_seconds == 60
+
+
+def test_afterhours_keeps_hourly_frequency_during_beijing_quiet_hours():
+    # 2026-01-06 00:30 UTC = 19:30 New York = 08:30 Beijing
+    decision = get_schedule_decision(_utc(2026, 1, 6, 0, 30))
+
+    assert decision.should_run is True
+    assert decision.session == MarketSession.AFTERHOURS
+    assert decision.interval_seconds == 60 * 60
 
 
 def test_weekend_daytime_market_does_not_run():

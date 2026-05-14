@@ -3,10 +3,8 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from gemini_stock.main import (
-    SymbolRunResult,
     maybe_send_daily_review,
     maybe_send_opening_silence_self_check,
-    maybe_send_premarket_brief,
     run_maintenance_tasks,
 )
 from gemini_stock.config import Settings
@@ -114,42 +112,6 @@ def _save_recent_alert(db: Database, created_at: str) -> None:
             """,
             (created_at,),
         )
-
-
-def test_maybe_send_premarket_brief_sends_once(monkeypatch, tmp_path):
-    db = Database(tmp_path / "brief.db")
-    db.initialize()
-    settings = Settings(
-        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token",
-        symbols=["TQQQ", "TSLL"],
-        benchmark_symbols=["SPY", "QQQ"],
-    )
-    captured = {"calls": 0, "text": ""}
-
-    def fake_send(webhook_url, text, now_fn=None, **kwargs):
-        captured["calls"] += 1
-        captured["text"] = text
-        return True
-
-    monkeypatch.setattr("gemini_stock.main.send_feishu_text", fake_send)
-
-    results = [
-        SymbolRunResult("SPY", "benchmark", _snapshot("SPY"), _signal("SPY"), pd.DataFrame()),
-        SymbolRunResult("QQQ", "benchmark", _snapshot("QQQ"), _signal("QQQ"), pd.DataFrame()),
-    ]
-    now = datetime(2026, 1, 5, 8, 40, tzinfo=timezone.utc).astimezone()
-    # convert to explicit New York local timestamp
-    now = datetime(2026, 1, 5, 8, 40).astimezone()
-
-    # use fixed NY premarket time with offset included
-    now = datetime.fromisoformat("2026-01-05T08:40:00-05:00")
-
-    maybe_send_premarket_brief(settings, db, results, now=now)
-    maybe_send_premarket_brief(settings, db, results, now=now)
-
-    assert captured["calls"] == 1
-    assert "【盘前观察】2026-01-05" in captured["text"]
-    assert db.has_alert_event("feishu", "premarket_briefing:2026-01-05") is True
 
 
 def test_maybe_send_daily_review_sends_once_at_beijing_eight(monkeypatch, tmp_path):

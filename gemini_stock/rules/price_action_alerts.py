@@ -16,6 +16,7 @@ class PriceActionAlert:
     latest_price: float
     reference_label: str
     reference_zone: list[float]
+    reason_text: str
     event_key: str
     timestamp_utc: datetime
     level: str = "P2"
@@ -68,6 +69,12 @@ def format_price_action_alert(
         "trim": "先减风险，不追空",
         "cover": "回补观察，别抢反弹",
     }.get(alert.action, "按计划处理")
+    reason_label = {
+        "buy": "买入原因",
+        "sell": "卖出原因",
+        "trim": "减仓原因",
+        "cover": "回补原因",
+    }.get(alert.action, "原因")
     title = "【优先到价提醒】" if alert.level == "P1" else "【价格到位】"
     lines = [
         f"{title}{alert.symbol}｜{zone_title}",
@@ -84,6 +91,7 @@ def format_price_action_alert(
         cost = f"{average_cost:.2f}" if average_cost is not None else "-"
         lines.append(f"持仓 {position}｜成本 {cost}")
     lines.append("提示：仅研究提醒，先看仓位和失效位。")
+    lines.append(f"{reason_label}：{alert.reason_text}。")
     return "\n".join(lines)
 
 
@@ -116,6 +124,12 @@ def build_price_action_card(
     else:
         header_text = f"P2 一般买入 {alert.symbol}"
         template = "orange"
+    reason_label = {
+        "buy": "买入原因",
+        "sell": "卖出原因",
+        "trim": "减仓原因",
+        "cover": "回补原因",
+    }.get(alert.action, "原因")
     return {
         "config": {"wide_screen_mode": True, "enable_forward": True},
         "header": {
@@ -132,7 +146,8 @@ def build_price_action_card(
                     f"**参考区**：{_format_zone(alert.reference_zone)}\n"
                     f"**动作**：{action_text}\n"
                     f"**仓位**：{position_line}\n"
-                    f"**提示**：先看失效条件与不追价区，再执行。"
+                    f"**提示**：先看失效条件与不追价区，再执行。\n"
+                    f"**{reason_label}**：{alert.reason_text}。"
                 ),
             },
         ],
@@ -150,6 +165,7 @@ def _alert(
 ) -> PriceActionAlert:
     normalized_zone = _normalize_zone(reference_zone)
     level = _buy_level(signal, action)
+    reason_text = _build_reason_text(signal, action, reference_label)
     if action == "buy":
         event_prefix = "price_action_p1" if level == "P1" else "price_action_p2"
     else:
@@ -160,6 +176,7 @@ def _alert(
         latest_price=latest_price,
         reference_label=reference_label,
         reference_zone=normalized_zone,
+        reason_text=reason_text,
         event_key=f"{event_prefix}:{signal.symbol}:{action}:{trading_date}:{_event_zone(normalized_zone)}",
         timestamp_utc=timestamp,
         level=level,
@@ -204,3 +221,16 @@ def _buy_level(signal: GeminiSignal, action: str) -> str:
     if signal.risk_reward_ratio < 1.8:
         return "P2"
     return "P1"
+
+
+def _build_reason_text(signal: GeminiSignal, action: str, reference_label: str) -> str:
+    base_reason = {
+        "buy": "价格进入 AI 买入参考区",
+        "sell": "价格进入 AI 卖出参考区",
+        "trim": "价格进入 AI 卖出参考区",
+        "cover": "价格进入 AI 回补买入区",
+    }.get(action, f"价格进入 {reference_label}")
+    details = [item.strip().rstrip("。.;； ") for item in signal.reasons if item and item.strip()]
+    if not details:
+        return base_reason
+    return "；".join([base_reason, *details[:1]])

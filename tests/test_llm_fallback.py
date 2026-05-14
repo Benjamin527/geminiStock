@@ -58,6 +58,8 @@ def test_rule_based_fallback_does_not_emit_trade_alerts():
     assert signal.should_alert is False
     assert signal.setup_type == "no_trade"
     assert signal.confidence <= 0.5
+    assert any("模式" in item for item in signal.reasons)
+    assert any("L1" in item for item in signal.risk_warnings)
 
 
 def test_json_analysis_raises_when_fallback_is_disabled():

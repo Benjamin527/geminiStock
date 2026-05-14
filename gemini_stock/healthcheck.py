@@ -30,13 +30,9 @@ def _check_dashboard() -> int:
 def _check_worker() -> int:
     settings = load_settings()
     db = Database(settings.database_path)
-    latest_llm_at = None
-    if db.path.exists():
-        with db.connect() as conn:
-            row = conn.execute("SELECT created_at_utc FROM llm_outputs ORDER BY id DESC LIMIT 1").fetchone()
-            latest_llm_at = row["created_at_utc"] if row else None
+    latest_worker_at = db.get_latest_worker_activity_time() if db.path.exists() else None
     health = evaluate_worker_health(
-        latest_llm_at,
+        latest_worker_at,
         get_schedule_decision(),
         stale_after_intervals=settings.worker_stale_after_intervals,
     )

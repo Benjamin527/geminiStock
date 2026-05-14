@@ -7,7 +7,7 @@ from gemini_stock.schedule import ScheduleDecision
 
 
 def evaluate_worker_health(
-    latest_llm_at: str | None,
+    latest_activity_at: str | None,
     decision: ScheduleDecision,
     now: datetime | None = None,
     stale_after_intervals: float = 2.5,
@@ -21,14 +21,14 @@ def evaluate_worker_health(
             "stale_after_seconds": int(decision.interval_seconds * stale_after_intervals),
         }
     stale_after_seconds = int(decision.interval_seconds * stale_after_intervals)
-    if not latest_llm_at:
+    if not latest_activity_at:
         return {
             "state": "no_data",
             "is_stale": True,
             "age_seconds": None,
             "stale_after_seconds": stale_after_seconds,
         }
-    latest = _parse_datetime(latest_llm_at)
+    latest = _parse_datetime(latest_activity_at)
     age_seconds = max(0, int((current - latest).total_seconds()))
     is_stale = age_seconds > stale_after_seconds
     return {

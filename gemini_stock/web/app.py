@@ -25,7 +25,6 @@ def create_app(
     database_path: str | Path | None = None,
     chart_dir: str | Path | None = None,
     symbols: list[str] | None = None,
-    benchmark_symbols: list[str] | None = None,
 ) -> FastAPI:
     settings = load_settings()
     db_path = Path(database_path or settings.database_path)
@@ -47,20 +46,8 @@ def create_app(
                 return dynamic
         return settings.symbols
 
-    def selected_benchmarks() -> list[str]:
-        if benchmark_symbols is not None:
-            return benchmark_symbols
-        if db is not None:
-            dynamic = db.list_watch_symbols("benchmark")
-            if dynamic:
-                return dynamic
-        return settings.benchmark_symbols
-
     def watchlist_payload() -> dict[str, list[str]]:
-        return {
-            "primary": selected_symbols(),
-            "benchmark": selected_benchmarks(),
-        }
+        return {"primary": selected_symbols()}
 
     def movement_alert_settings_payload() -> dict:
         thresholds = db.get_movement_alert_threshold_settings()
@@ -73,23 +60,20 @@ def create_app(
 
     def build_dashboard_payload() -> dict[str, Any]:
         symbols_now = selected_symbols()
-        benchmarks_now = selected_benchmarks()
         status = repo.get_status()
         metrics = repo.get_today_metrics(symbols_now)
         symbol_states = repo.get_symbol_states(symbols_now)
-        benchmark_states = repo.get_benchmark_states(benchmarks_now)
         llm_outputs = repo.get_recent_llm_outputs(symbols_now)
-        alerts = repo.get_recent_alerts(symbols_now + benchmarks_now)
+        alerts = repo.get_recent_alerts(symbols_now)
         errors = repo.get_recent_errors(symbols_now)
         watchlist = watchlist_payload()
         movement_alert_settings = movement_alert_settings_payload()
-        priority_views = repo.build_priority_views(symbols_now, benchmarks_now)
+        priority_views = repo.build_priority_views(symbols_now)
         return {
             "generated_at_utc": utc_now_iso(),
             "status": status,
             "today_metrics": metrics,
             "symbols": symbol_states,
-            "benchmarks": benchmark_states,
             "recent_llm_outputs": llm_outputs,
             "recent_alerts": alerts,
             "recent_errors": errors,
@@ -105,7 +89,6 @@ def create_app(
             status=payload["status"],
             metrics=payload["today_metrics"],
             symbols=payload["symbols"],
-            benchmarks=payload["benchmarks"],
             llm_outputs=payload["recent_llm_outputs"],
             alerts=payload["recent_alerts"],
             errors=payload["recent_errors"],
@@ -126,6 +109,8 @@ def create_app(
             "worker_health": status["worker_health"],
             "market_session": status["market_session"],
             "latest_llm_at": status["latest_llm_at"],
+            "latest_alert_at": status.get("latest_alert_at"),
+            "latest_worker_activity_at": status.get("latest_worker_activity_at"),
         }
 
     @app.get("/api/watchlist")
@@ -324,7 +309,6 @@ def _build_dashboard_template_values(
     status: dict,
     metrics: dict,
     symbols: list[dict],
-    benchmarks: list[dict],
     llm_outputs: list[dict],
     alerts: list[dict],
     errors: list[dict],
@@ -334,7 +318,6 @@ def _build_dashboard_template_values(
 ) -> dict[str, str]:
     ordered_symbols = sorted(symbols, key=_symbol_sort_key)
     symbol_cards = "\n".join(_render_symbol_card(item) for item in ordered_symbols)
-    benchmark_cards = "\n".join(_render_benchmark_card(item) for item in benchmarks)
     llm_mobile_cards = "\n".join(_render_llm_mobile_card(row) for row in llm_outputs[:8]) or "<div class='feed-card muted-row'>暂无 AI 分析记录</div>"
     alert_mobile_cards = "\n".join(_render_alert_mobile_card(row) for row in alerts[:8]) or "<div class='feed-card muted-row'>暂无报警记录</div>"
     metric_cards = "\n".join(
@@ -419,7 +402,6 @@ def _build_dashboard_template_values(
         "PRIORITY_CARDS": priority_cards,
         "CONFIG_WARNING": f"配置提醒：本地 .env 含敏感字段 {warning_text}，建议轮换并移入密钥管理。" if warning_text else "",
         "WATCH_PRIMARY": " · ".join(watchlist.get("primary") or []) or "-",
-        "WATCH_BENCHMARK": " · ".join(watchlist.get("benchmark") or []) or "-",
         "PRIMARY_WATCH_ITEMS": primary_watch_items,
         "DROP_TIER_1": str(drop_thresholds[0]),
         "DROP_TIER_2": str(drop_thresholds[1]),
@@ -428,7 +410,6 @@ def _build_dashboard_template_values(
         "RISE_TIER_2": str(rise_thresholds[1]),
         "RISE_TIER_3": str(rise_thresholds[2]),
         "SYMBOL_CARDS": symbol_cards,
-        "BENCHMARK_CARDS": benchmark_cards,
         "METRIC_CARDS": metric_cards,
         "COST_PANEL": (
             '<h2>AI 调用成本代理</h2>'
@@ -448,7 +429,6 @@ def render_dashboard(
     status: dict,
     metrics: dict,
     symbols: list[dict],
-    benchmarks: list[dict],
     llm_outputs: list[dict],
     alerts: list[dict],
     errors: list[dict],
@@ -460,7 +440,6 @@ def render_dashboard(
         status=status,
         metrics=metrics,
         symbols=symbols,
-        benchmarks=benchmarks,
         llm_outputs=llm_outputs,
         alerts=alerts,
         errors=errors,
@@ -546,43 +525,6 @@ def _render_symbol_card(item: dict) -> str:
       </div>
       <div class="events">{events}</div>
       {chart}
-    </article>
-    """
-
-
-def _render_benchmark_card(item: dict) -> str:
-    return f"""
-    <article class="benchmark-card">
-      <div class="benchmark-head">
-        <div>
-          <b>{item['symbol']}</b>
-          <div class="meta-row">
-            <span class="pill bias-{item['bias'] or 'neutral'}">{_label(item['bias'])}</span>
-            <span class="pill">{item['expected_move']}</span>
-          </div>
-        </div>
-        <div class="score-wrap">
-          <div class="score {'negative' if isinstance(item['sentiment_score'], (int, float)) and item['sentiment_score'] < 0 else ''}">{_fmt(item['regular_market_price'])}</div>
-          <div class="confidence">{_fmt(item['regular_market_time'])}</div>
-        </div>
-      </div>
-      <div class="benchmark-note">{item['outlook_note']}</div>
-      <div class="benchmark-grid">
-        <div class="cell"><span>常规盘区间</span>{item.get('day_range', '-')}</div>
-        <div class="cell"><span>分数 / 置信度</span>{_fmt(item['sentiment_score'])} / {_fmt(item['confidence'])}</div>
-        <div class="cell"><span>走弱触发</span>{_fmt(item['support_level'])}</div>
-        <div class="cell"><span>走强触发</span>{_fmt(item['resistance_level'])}</div>
-        <div class="cell"><span>RSI</span>{_fmt(item['rsi_14'])}</div>
-        <div class="cell"><span>EMA20 / EMA50</span>{_fmt(item['ema_20'])} / {_fmt(item['ema_50'])}</div>
-      </div>
-      <details class="scenario-group">
-        <summary>路径预期</summary>
-        <div class="scenario-list">
-          <div class="benchmark-note">{_fmt(item.get('upside_scenario'))}</div>
-          <div class="benchmark-note">{_fmt(item.get('downside_scenario'))}</div>
-          <div class="benchmark-note">{_fmt(item.get('rebound_scenario'))}</div>
-        </div>
-      </details>
     </article>
     """
 

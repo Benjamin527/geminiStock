@@ -244,25 +244,25 @@ def _classify_outcome(signal: GeminiSignal, entered: bool, stopped: bool, target
 
 def _symbol_lesson(signal: GeminiSignal, entered: bool, stopped: bool, target_hit: bool, first_close: float, last_close: float) -> str:
     if signal.bias == "neutral" or signal.setup_type == "no_trade":
-        return "观望信号优先检查是否避免追价和情绪交易。"
+        return "观望信号先看模式是否真的切换，避免把事件前平静或盘中小 V 误当成安全修复。"
     if not entered:
         return "价格没有进入参考区，后续继续等待二次握手，不追离 L1 太远的反弹。"
     if target_hit and not stopped:
-        return "建议与走势匹配，保留分批止盈和尾盘确认规则。"
+        return "建议与走势匹配，继续保留分批止盈、尾盘确认和不追离 L1 太远反弹的纪律。"
     if stopped:
-        return "信号失效条件被触发，后续要更重视 L1 跌破、板块同步和仓位约束。"
+        return "信号失效条件被触发，后续要先看模式切换，再重视 L1 跌破、板块同步和尾盘是否继续走弱。"
     move_pct = (last_close - first_close) / first_close * 100 if first_close else 0
     if signal.bias == "bullish" and move_pct < 0:
-        return "偏多判断和收盘方向不一致，后续降低首次试探仓位，等待二次握手确认。"
+        return "偏多判断和收盘方向不一致，后续降低首次试探仓位；若只是单边下跌里的小 V，先按日内 T 处理。"
     if signal.bias == "bearish" and move_pct > 0:
         return "偏空判断和收盘方向不一致，后续避免在回补买入区附近继续看空。"
-    return "走势尚未验证目标，继续把不追价区、失效条件和仓位约束写清楚。"
+    return "走势尚未验证目标，继续把不追价区、失效条件、仓位约束和事件窗口写清楚。"
 
 
 def _build_learning_notes(reviews: list[SymbolReview]) -> list[str]:
     if not reviews:
-        return ["没有足够样本，不更新交易偏好；下一次继续先记录 L1，再等二次握手。"]
-    notes = ["每天固定复盘建议与实际走势，保留 L1、二次握手、失效条件和不追价区四个字段。"]
+        return ["没有足够样本，不更新交易偏好；下一次先判断模式，再记录 L1，继续等二次握手。"]
+    notes = ["每天固定复盘建议与实际走势，至少保留 模式判断、L1、二次握手、失效条件、不追价区 五个字段。"]
     misses = [review for review in reviews if review.outcome == "miss"]
     if misses:
         symbols = "、".join(review.symbol for review in misses)
@@ -272,6 +272,8 @@ def _build_learning_notes(reviews: list[SymbolReview]) -> list[str]:
     neutral = [review for review in reviews if review.outcome == "neutral"]
     if neutral:
         notes.append("未触发参考区的信号不强行评分为失败，继续等待回踩或尾盘确认，避免为了交易而交易。")
+    notes.append("如果 3:30 pm 后仍反复出低点，就把尾盘弱势当成活的模式记忆，次日别急着抢第一脚。")
+    notes.append("遇到财报、减持、被动减仓或节日前后，按多日时间窗看缺口回补和二次回踩，不把真空期平静当成落地后安全。")
     notes.append("次日盘中先看结论分级，再看价位区间与条件，最后才看仓位，避免情绪先行。")
     return notes
 

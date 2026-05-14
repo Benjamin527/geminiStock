@@ -77,26 +77,6 @@ def test_fast_drop_near_support_creates_primary_movement_alert():
     assert "本档告警" in card["elements"][0]["content"]
 
 
-def test_fast_drop_for_benchmark_uses_market_label():
-    alerts = build_movement_alerts(
-        _technical(symbol="SPY", close=512.4, rsi=39.0).model_copy(
-            update={"support_levels": [511.8, 508.0], "atr_14": 2.4}
-        ),
-        _candles([519.1, 518.4, 517.5, 516.8, 515.7, 514.9, 514.0, 513.2, 512.7, 512.4]),
-        profile="benchmark",
-        trading_date="2026-01-05",
-        threshold_pcts=[1.2, 2.0, 3.0],
-    )
-
-    assert len(alerts) == 1
-    text = format_movement_alert(alerts[0])
-    assert text.splitlines()[0] == "【大盘异动】SPY｜跌幅 1档预警"
-    assert "先看大盘承接" in text
-    assert "只看环境" in text
-    card = build_movement_alert_card(alerts[0])
-    assert card["header"]["title"]["content"] == "大盘异动 SPY｜跌幅 1档"
-
-
 def test_fast_drop_for_crypto_uses_crypto_label():
     alerts = build_movement_alerts(
         "BTC-USD",

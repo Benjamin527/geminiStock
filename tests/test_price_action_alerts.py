@@ -59,6 +59,7 @@ def test_price_action_alert_triggers_bullish_entry_zone():
     assert "现价 12.15｜参考 12.10-12.20" in text
     assert "动作：分批试探，别追价" in text
     assert "等级：P2｜一般买入提醒" in text
+    assert "买入原因：价格进入 AI 买入参考区；Price is holding near the AI entry zone。" in text
 
 
 def test_price_action_alert_triggers_bullish_take_profit_zone():
@@ -72,6 +73,7 @@ def test_price_action_alert_triggers_bullish_take_profit_zone():
     assert "【价格到位】TSLL｜止盈区" in text
     assert "现价 12.70｜参考 12.60-12.80" in text
     assert "动作：分批止盈，保留计划" in text
+    assert "卖出原因：价格进入 AI 卖出参考区；Price is holding near the AI entry zone。" in text
 
 
 def test_price_action_alert_still_tracks_actionable_non_alert_signals():
@@ -117,6 +119,7 @@ def test_price_action_alert_uses_long_only_labels_for_bearish_signal():
     text = format_price_action_alert(alerts[0])
     assert "【价格到位】TSLL｜减仓区" in text
     assert "动作：先减风险，不追空" in text
+    assert "减仓原因：价格进入 AI 卖出参考区；Price is holding near the AI entry zone。" in text
 
 
 def test_price_action_alert_can_include_position_context():
@@ -150,4 +153,5 @@ def test_build_price_action_card_for_high_priority_alert():
     assert "等级" in markdown
     assert "现价" in markdown
     assert "参考区" in markdown
+    assert "**买入原因**：价格进入 AI 买入参考区；Price is holding near the AI entry zone。" in markdown
     assert len(card["elements"]) == 1

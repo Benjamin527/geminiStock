@@ -1,10 +1,8 @@
 from datetime import datetime, timezone
 
-from gemini_stock.benchmarks import BenchmarkForecast
 from gemini_stock.notify.channels import (
     FeishuNotifier,
     format_alert,
-    format_premarket_brief,
     send_feishu_text,
     send_feishu_interactive_card,
 )
@@ -195,10 +193,10 @@ def test_alert_text_uses_chinese_labels_and_translated_enums():
     assert "买入 99.00-100.00｜止损 96.00｜目标 105.00-106.00" in text
     assert "动作：分批试探，等二次确认" in text
     assert "提示：仅研究提醒，破失效位先降风险。" in text
-    assert len(text.splitlines()) <= 6
+    assert "买入原因：Oversold bounce setup。" in text
+    assert len(text.splitlines()) <= 7
     assert "Bias:" not in text
     assert "Setup:" not in text
-    assert "Oversold bounce setup." not in text
 
 
 def test_alert_text_uses_long_only_labels_for_bearish_signal():
@@ -207,42 +205,6 @@ def test_alert_text_uses_long_only_labels_for_bearish_signal():
     assert text.splitlines()[0] == "【盯盘提醒】TSLL｜看空｜看空破位"
     assert "卖出 12.14-12.16｜风险 12.27｜回补 11.96-12.09" in text
     assert "动作：先减风险，不追空" in text
-    assert len(text.splitlines()) <= 6
+    assert "卖出原因：Oversold bounce setup。" in text
+    assert len(text.splitlines()) <= 7
 
-
-def test_format_premarket_brief_includes_benchmark_paths():
-    forecasts = [
-        BenchmarkForecast(
-            symbol="SPY",
-            bias="bullish",
-            current_price=515.2,
-            support_level=509.0,
-            resistance_level=518.0,
-            expected_move="震荡偏强",
-            outlook_note="test",
-            upside_scenario="若上破 518.00，短线更容易去到 522.00-525.00。",
-            downside_scenario="若失守 509.00，可能回看 503.00-506.00。",
-            rebound_scenario="回踩 503.00-507.00 更容易出现承接。",
-        ),
-        BenchmarkForecast(
-            symbol="QQQ",
-            bias="bearish",
-            current_price=648.0,
-            support_level=642.0,
-            resistance_level=650.0,
-            expected_move="震荡偏弱",
-            outlook_note="test",
-            upside_scenario="若上破 650.00，短线更容易去到 662.00-670.00。",
-            downside_scenario="若失守 642.00，可能回看 635.00-638.00。",
-            rebound_scenario="反弹先看 650.00 一带压力，回落承接区在 635.00-639.00。",
-        ),
-    ]
-
-    text = format_premarket_brief(forecasts, trading_date="2026-01-05")
-
-    assert text.splitlines()[0] == "【盘前观察】2026-01-05"
-    assert "SPY｜偏强｜现价 515.20｜区间 -" in text
-    assert "触发：破 509.00 / 上 518.00" in text
-    assert "QQQ｜偏弱｜现价 648.00｜区间 -" in text
-    assert "提示：开盘后以真实走势为准。" in text
-    assert len(text.splitlines()) <= 8

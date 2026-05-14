@@ -3,9 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 from gemini_stock.data.base import NEW_YORK
 from gemini_stock.market_calendar import is_trading_day, next_trading_day, regular_close_time
+
+BEIJING = ZoneInfo("Asia/Shanghai")
+BEIJING_QUIET_HOURS_INTERVAL_SECONDS = 30 * 60
 
 
 class MarketSession(StrEnum):
@@ -43,13 +47,13 @@ def get_schedule_decision(now: datetime | None = None) -> ScheduleDecision:
     current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
     session = classify_market_session(now)
     if session == MarketSession.OVERNIGHT:
-        return ScheduleDecision(True, session, 5 * 60)
+        return ScheduleDecision(True, session, _apply_beijing_quiet_hours(5 * 60, current))
     if session == MarketSession.PREMARKET:
-        return ScheduleDecision(True, session, 5 * 60)
+        return ScheduleDecision(True, session, _apply_beijing_quiet_hours(5 * 60, current))
     if session == MarketSession.REGULAR:
-        return ScheduleDecision(True, session, _regular_interval_seconds(current))
+        return ScheduleDecision(True, session, _apply_beijing_quiet_hours(_regular_interval_seconds(current), current))
     if session == MarketSession.AFTERHOURS:
-        return ScheduleDecision(True, session, 60 * 60)
+        return ScheduleDecision(True, session, _apply_beijing_quiet_hours(60 * 60, current))
     return ScheduleDecision(False, session, seconds_until_next_session(now))
 
 
@@ -112,3 +116,14 @@ def _regular_interval_seconds(current: datetime) -> int:
     if midday_fast_end <= current < late_session_start:
         return 10 * 60
     return 2 * 60
+
+
+def _apply_beijing_quiet_hours(interval_seconds: int, current: datetime) -> int:
+    if _in_beijing_quiet_hours(current):
+        return max(interval_seconds, BEIJING_QUIET_HOURS_INTERVAL_SECONDS)
+    return interval_seconds
+
+
+def _in_beijing_quiet_hours(current: datetime) -> bool:
+    beijing_time = current.astimezone(BEIJING).time()
+    return beijing_time >= time(23, 30) or beijing_time < time(9, 30)

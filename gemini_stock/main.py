@@ -16,7 +16,6 @@ try:
 except Exception:  # pragma: no cover - fallback only used when dependency is absent locally
     ddtrace_tracer = None
 
-from gemini_stock.benchmarks import build_benchmark_forecast
 from gemini_stock.charts.renderer import ChartRenderer
 from gemini_stock.config import Settings, load_settings
 from gemini_stock.data.base import MarketDataError, NEW_YORK
@@ -37,19 +36,27 @@ from gemini_stock.notify.channels import (
     TelegramNotifier,
     WeComNotifier,
     build_opening_silence_self_check_card,
-    format_premarket_brief,
     format_opening_silence_self_check,
     send_feishu_interactive_card,
     send_feishu_text,
 )
 from gemini_stock.replay import build_daily_review, format_daily_review
-from gemini_stock.rules.alert_rules import AlertRuleEngine, BenchmarkAlertRuleEngine
-from gemini_stock.rules.movement_alerts import build_movement_alert_card, build_movement_alerts, format_movement_alert
+from gemini_stock.rules.alert_rules import AlertRuleEngine
+from gemini_stock.rules.movement_alerts import (
+    DEFAULT_MOVEMENT_ALERT_WINDOW_MINUTES,
+    build_movement_alert_card,
+    build_movement_alerts,
+    format_movement_alert,
+)
 from gemini_stock.rules.price_action_alerts import build_price_action_alerts, build_price_action_card, format_price_action_alert
 from gemini_stock.schedule import MarketSession, ai_analysis_window_open, get_schedule_decision
 from gemini_stock.storage.db import Database
 
 logger = logging.getLogger(__name__)
+
+PURE_MOVEMENT_ONLY_INTERVAL_MINUTES = 30
+PURE_MOVEMENT_ONLY_WINDOW_MINUTES = 30
+_LAST_MOVEMENT_ONLY_SCAN_BUCKET: str | None = None
 
 
 def _tracing_env_configured(env: dict[str, str | None] | None = None) -> bool:
@@ -144,7 +151,7 @@ def run_symbol(
     symbol: str,
     settings: Settings,
     db: Database,
-    rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
+    rules: AlertRuleEngine,
     profile: str = "primary",
     context: RuntimeContext | None = None,
     allow_ai: bool = True,
@@ -228,10 +235,7 @@ def run_symbol(
                 logger.error("gemini_multimodal_review_failed", extra={"symbol": symbol, "error": str(exc)})
                 return None
 
-        if isinstance(rules, BenchmarkAlertRuleEngine):
-            decision = rules.evaluate(final_signal, snapshot, candles_1m)
-        else:
-            decision = rules.evaluate(final_signal, snapshot)
+        decision = rules.evaluate(final_signal, snapshot)
         result = SymbolRunResult(symbol=symbol, profile=profile, snapshot=snapshot, signal=final_signal, candles_1m=candles_1m)
         if profile == "primary" and (decision.should_alert or decision.reason == "cooldown_active"):
             maybe_send_price_action_alerts(settings, db, symbol, final_signal, candles_1m)
@@ -246,7 +250,7 @@ def run_symbol(
         event_key = build_decision_alert_event_key(decision, alert_trading_date)
         payload = decision.json_dict()
         payload["event_key"] = event_key
-        payload["type"] = "benchmark_alert" if isinstance(rules, BenchmarkAlertRuleEngine) else "primary_alert"
+        payload["type"] = "primary_alert"
         for notifier in runtime.notifiers:
             try:
                 if not should_send_decision_alert(db, notifier.channel, decision, event_key, datetime.now(timezone.utc), settings.alert_cooldown_minutes):
@@ -265,7 +269,6 @@ def run_once(settings: Settings, now: datetime | None = None) -> None:
     db = Database(settings.database_path)
     db.initialize()
     primary_symbols = db.list_watch_symbols("primary") or settings.symbols
-    benchmark_symbols = db.list_watch_symbols("benchmark") or settings.benchmark_symbols
     context = RuntimeContext.from_settings(settings)
     ai_enabled = ai_analysis_window_open(now)
     with _trace_span(
@@ -273,12 +276,9 @@ def run_once(settings: Settings, now: datetime | None = None) -> None:
         data_provider=settings.data_provider,
         llm_provider=settings.llm_provider,
         symbol_count=len(primary_symbols),
-        benchmark_symbol_count=len(benchmark_symbols),
         ai_enabled=ai_enabled,
     ):
         primary_rules = AlertRuleEngine(settings.alert_cooldown_minutes)
-        benchmark_rules = BenchmarkAlertRuleEngine(settings.alert_cooldown_minutes)
-        benchmark_results: list[SymbolRunResult] = []
         _run_symbol_batch(
             primary_symbols,
             settings,
@@ -287,23 +287,10 @@ def run_once(settings: Settings, now: datetime | None = None) -> None:
             profile="primary",
             context=context,
             allow_ai=ai_enabled,
-        )
-        benchmark_results.extend(
-            result
-            for result in _run_symbol_batch(
-                benchmark_symbols,
-                settings,
-                db,
-                benchmark_rules,
-                profile="benchmark",
-                context=context,
-                allow_ai=ai_enabled,
-            )
-            if result is not None and result.signal is not None
+            now=now,
         )
         with _trace_span("worker.run_movement_only"):
-            run_movement_only_once(settings, db=db, context=context, exclude_symbols=[*primary_symbols, *benchmark_symbols])
-        maybe_send_premarket_brief(settings, db, benchmark_results)
+            run_movement_only_once(settings, db=db, context=context, exclude_symbols=primary_symbols, now=now)
         with _trace_span("worker.maintenance"):
             run_maintenance_tasks(settings, db=db, review_symbols=primary_symbols)
         maybe_send_opening_silence_self_check(settings, db, primary_symbols)
@@ -313,22 +300,23 @@ def _run_symbol_batch(
     symbols: list[str],
     settings: Settings,
     db: Database,
-    rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
+    rules: AlertRuleEngine,
     profile: str,
     context: RuntimeContext,
     allow_ai: bool,
+    now: datetime | None = None,
 ) -> list[SymbolRunResult | None]:
     if not symbols:
         return []
 
     max_workers = max(1, min(settings.worker_max_concurrency, len(symbols)))
     if max_workers == 1:
-        return [_run_symbol_task(symbol, settings, db, rules, profile, context, allow_ai) for symbol in symbols]
+        return [_run_symbol_task(symbol, settings, db, rules, profile, context, allow_ai, now=now) for symbol in symbols]
 
     results_by_symbol: dict[str, SymbolRunResult | None] = {}
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{profile}-worker") as executor:
         futures = {
-            executor.submit(_run_symbol_task, symbol, settings, db, rules, profile, context, allow_ai): symbol
+            executor.submit(_run_symbol_task, symbol, settings, db, rules, profile, context, allow_ai, now): symbol
             for symbol in symbols
         }
         for future in as_completed(futures):
@@ -341,11 +329,16 @@ def _run_symbol_task(
     symbol: str,
     settings: Settings,
     db: Database,
-    rules: AlertRuleEngine | BenchmarkAlertRuleEngine,
+    rules: AlertRuleEngine,
     profile: str,
     context: RuntimeContext,
     allow_ai: bool,
+    now: datetime | None = None,
 ) -> SymbolRunResult | None:
+    if _should_defer_yfinance_symbol(symbol, context, now=now):
+        _save_provider_sleep_heartbeat(db, symbol)
+        logger.info("symbol_run_deferred", extra={"symbol": symbol, "profile": profile, "reason": "yfinance_overnight_gap"})
+        return None
     try:
         return run_symbol(
             symbol,
@@ -364,13 +357,42 @@ def _run_symbol_task(
     return None
 
 
+def _should_defer_yfinance_symbol(symbol: str, context: RuntimeContext, now: datetime | None = None) -> bool:
+    data_provider = getattr(context, "data_provider", None)
+    if not isinstance(data_provider, YFinanceMarketDataProvider):
+        return False
+    current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
+    return get_schedule_decision(current).session == MarketSession.OVERNIGHT
+
+
+def _save_provider_sleep_heartbeat(db: Database, symbol: str) -> None:
+    payload = {
+        "analysis_level": "market_data",
+        "symbol": symbol,
+        "provider_state": "overnight_gap",
+    }
+    db.save_llm_output(
+        symbol,
+        payload,
+        {
+            "analysis_level": "market_data",
+            "provider_state": "overnight_gap",
+            "should_alert": False,
+        },
+        None,
+    )
+
+
 def run_movement_only_once(
     settings: Settings,
     db: Database | None = None,
     context: RuntimeContext | None = None,
     exclude_symbols: list[str] | None = None,
+    now: datetime | None = None,
 ) -> int:
     if not settings.movement_alert_symbols:
+        return 0
+    if not _should_run_movement_only_scan(now):
         return 0
     database = db or Database(settings.database_path)
     if db is None:
@@ -407,7 +429,23 @@ def run_movement_only_symbol(
         candles_1m,
         profile="crypto",
         trading_date=trading_date,
+        window_minutes=PURE_MOVEMENT_ONLY_WINDOW_MINUTES,
     )
+
+
+def _should_run_movement_only_scan(now: datetime | None = None) -> bool:
+    global _LAST_MOVEMENT_ONLY_SCAN_BUCKET
+    bucket = _movement_only_scan_bucket(now)
+    if _LAST_MOVEMENT_ONLY_SCAN_BUCKET == bucket:
+        return False
+    _LAST_MOVEMENT_ONLY_SCAN_BUCKET = bucket
+    return True
+
+
+def _movement_only_scan_bucket(now: datetime | None = None) -> str:
+    current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
+    bucket_minute = (current.minute // PURE_MOVEMENT_ONLY_INTERVAL_MINUTES) * PURE_MOVEMENT_ONLY_INTERVAL_MINUTES
+    return f"{current.date().isoformat()}:{current.hour:02d}{bucket_minute:02d}"
 
 
 def run_maintenance_tasks(
@@ -420,53 +458,6 @@ def run_maintenance_tasks(
     if db is None:
         database.initialize()
     maybe_send_daily_review(settings, database, review_symbols=review_symbols or settings.symbols, now=now)
-
-
-def maybe_send_premarket_brief(
-    settings: Settings,
-    db: Database,
-    benchmark_results: list[SymbolRunResult],
-    now: datetime | None = None,
-) -> None:
-    if not benchmark_results:
-        return
-    current = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
-    schedule = get_schedule_decision(current)
-    if schedule.session != MarketSession.PREMARKET:
-        return
-    if current.time() < dt_time(8, 30):
-        return
-    event_key = f"premarket_briefing:{current.date().isoformat()}"
-    if db.has_alert_event("feishu", event_key):
-        return
-
-    forecasts = [
-        build_benchmark_forecast(result.snapshot, result.signal)
-        for result in benchmark_results
-        if result.profile == "benchmark"
-    ]
-    if not forecasts:
-        return
-    text = format_premarket_brief(forecasts, trading_date=current.date().isoformat())
-    try:
-        sent = send_feishu_text(
-            settings.feishu_webhook_url,
-            text,
-        )
-    except Exception as exc:
-        logger.error("premarket_brief_failed", extra={"error": str(exc)})
-        return
-    if sent:
-        db.save_alert(
-            "MARKET_BRIEF",
-            {
-                "event_key": event_key,
-                "type": "premarket_briefing",
-                "symbols": [forecast.symbol for forecast in forecasts],
-                "text": text,
-            },
-            "feishu",
-        )
 
 
 def maybe_send_daily_review(
@@ -528,7 +519,7 @@ def maybe_send_opening_silence_self_check(
         return False
 
     worker_health = evaluate_worker_health(
-        db.get_latest_llm_output_time(),
+        db.get_latest_worker_activity_time(),
         schedule,
         now=current_ny.astimezone(timezone.utc),
         stale_after_intervals=settings.worker_stale_after_intervals,
@@ -655,6 +646,7 @@ def maybe_send_movement_alerts(
     candles_1m: pd.DataFrame,
     profile: str,
     trading_date: str | None = None,
+    window_minutes: int = DEFAULT_MOVEMENT_ALERT_WINDOW_MINUTES,
 ) -> int:
     if candles_1m.empty:
         return 0
@@ -666,6 +658,7 @@ def maybe_send_movement_alerts(
         profile=profile,
         trading_date=alert_date,
         threshold_pcts=db.get_movement_alert_threshold_settings(),
+        window_minutes=window_minutes,
     )
     sent_count = 0
     for alert in alerts:
@@ -732,8 +725,7 @@ def should_send_decision_alert(
 ) -> bool:
     if db.has_alert_event(channel, event_key):
         return False
-    alert_type = "benchmark_alert" if str(decision.reason).startswith("benchmark_") else "primary_alert"
-    return not db.has_recent_alert_type(decision.symbol, channel, alert_type, now=now, within_minutes=cooldown_minutes)
+    return not db.has_recent_alert_type(decision.symbol, channel, "primary_alert", now=now, within_minutes=cooldown_minutes)
 
 
 def _event_zone(values: list[float]) -> str:
@@ -783,7 +775,6 @@ def main() -> None:
         "service_started",
         extra={
             "symbols": settings.symbols,
-            "benchmark_symbols": settings.benchmark_symbols,
             "llm_provider": settings.llm_provider,
             "model": settings.openai_model if settings.llm_provider == "openai" else settings.gemini_model,
         },

@@ -5,24 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/dashboard.css">
   <title>美股 AI 盯盘控制台</title>
 </head>
-<body data-dashboard-shell="coinbase">
+<body data-dashboard-shell="binance">
   <header class="hero-shell">
     <div class="hero-bar">
       <div class="hero-brand">
         <div class="brand-mark" aria-hidden="true"></div>
         <span>Gemini Stock Monitor</span>
       </div>
-      <div class="hero-caption">Institutional watch for leveraged AI setups</div>
+      <div class="hero-caption">High-frequency watch surface for AI momentum names</div>
     </div>
     <div class="hero-copy">
       <div>
-        <p class="eyebrow">Coinbase-style monitoring surface</p>
+        <p class="eyebrow">Binance-style market surface</p>
         <h1>美股 AI 盯盘控制台</h1>
-        <p class="hero-sub">只读监控页面，不提供交易和下单操作。界面采用低噪声、机构感的信息层级，数据仍按 30 秒节奏局部更新。</p>
+        <p class="hero-sub">只读监控页面，不提供交易和下单操作。界面改为深色高对比行情面板风格，用更强的主次层级、红绿涨跌与黄黑品牌强调来加快扫盘速度。</p>
       </div>
       <div class="hero-actions">
         <button class="hero-pill primary" type="button" onclick="document.querySelector('[data-panel=&quot;settings&quot;]')?.setAttribute('open','open')">监控设置</button>
@@ -34,7 +34,6 @@
   <main id="dashboard-root">
     <nav class="mobile-tabs" aria-label="Dashboard sections">
       <button class="mobile-tab active" type="button" data-tab-target="main">主观察</button>
-      <button class="mobile-tab" type="button" data-tab-target="market">大盘</button>
       <button class="mobile-tab" type="button" data-tab-target="activity">告警</button>
       <button class="mobile-tab" type="button" data-tab-target="settings">设置</button>
     </nav>
@@ -74,7 +73,6 @@
           <div class="watch-panel">
             <div class="watch-meta">
               <div class="sub" id="watch-primary-summary">主监控：$WATCH_PRIMARY</div>
-              <div class="sub" id="watch-benchmark-summary">参考监控：$WATCH_BENCHMARK</div>
               <div class="watch-badges">$PRIMARY_WATCH_ITEMS</div>
             </div>
             <form class="watch-form" id="watch-form">
@@ -90,7 +88,7 @@
               <p class="eyebrow">Thresholds</p>
               <h2>价格异动阈值</h2>
             </div>
-            <p class="section-copy">快跌和快涨分别设置三档；1档推送 1 次，2档推送 2 次，3档推送 3 次。</p>
+            <p class="section-copy">纯价格监控每 30 分钟检查最近 30 分钟的快跌和快涨；1档推送 1 次，2档推送 2 次，3档推送 3 次。</p>
           </div>
           <div class="movement-settings">
             <div>
@@ -138,17 +136,6 @@
         <p class="section-copy">交易动作、价位计划和技术上下文统一收在同一张卡片里，优先帮助你判断是否需要介入。</p>
       </div>
       <div class="cards" id="symbol-cards">$SYMBOL_CARDS</div>
-    </section>
-
-    <section data-panel="market">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">Benchmarks</p>
-          <h2>大盘观察</h2>
-        </div>
-        <p class="section-copy">用更轻的市场摘要卡片查看参考指数方向、区间和触发位。</p>
-      </div>
-      <div class="benchmark-cards" id="benchmark-cards">$BENCHMARK_CARDS</div>
     </section>
 
     <div class="overview" data-panel="activity">

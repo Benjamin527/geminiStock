@@ -90,24 +90,6 @@ def test_maybe_send_movement_alerts_repeats_by_tier(tmp_path, monkeypatch):
     assert db.has_alert_event("feishu", "movement:TSLL:fast_drop:tier3:2026-01-05:1500:n3") is True
 
 
-def test_maybe_send_movement_alerts_uses_benchmark_message_copy(tmp_path, monkeypatch):
-    sent_cards = []
-    monkeypatch.setattr("gemini_stock.main.send_feishu_interactive_card", lambda webhook_url, card, **kwargs: sent_cards.append(card) or True)
-    monkeypatch.setattr("gemini_stock.main.send_feishu_text", lambda webhook_url, text, **kwargs: (_ for _ in ()).throw(AssertionError("movement alerts should use cards")))
-    settings = Settings(feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/token")
-    db = Database(tmp_path / "signals.db")
-    db.initialize()
-    db.save_movement_alert_thresholds([1.2, 2.0, 3.0])
-    technical = _technical(symbol="SPY", close=512.4).model_copy(update={"support_levels": [511.8, 508.0], "atr_14": 2.4})
-    candles = _candles().assign(close=[519.1, 518.4, 517.5, 516.8, 515.7, 514.9, 514.0, 513.2, 512.7, 512.4])
-
-    count = maybe_send_movement_alerts(settings, db, technical, candles, profile="benchmark", trading_date="2026-01-05")
-
-    assert count == 1
-    assert sent_cards[0]["header"]["title"]["content"] == "大盘异动 SPY｜跌幅 1档"
-    assert "只看环境" in sent_cards[0]["elements"][0]["content"]
-
-
 def test_maybe_send_movement_alerts_sends_fast_rise_card(tmp_path, monkeypatch):
     sent_cards = []
     monkeypatch.setattr("gemini_stock.main.send_feishu_interactive_card", lambda webhook_url, card, **kwargs: sent_cards.append(card) or True)
@@ -154,3 +136,37 @@ def test_run_movement_only_symbol_scans_btc_without_ai_or_15m(tmp_path, monkeypa
     assert count == 1
     assert calls == [("BTC-USD", "1m", settings.yfinance_period_1m)]
     assert sent_cards[0]["header"]["title"]["content"] == "币种异动 BTC-USD｜跌幅 1档"
+
+
+def test_run_movement_only_symbol_uses_thirty_minute_window(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeProvider:
+        def get_ohlcv(self, symbol, interval, period):
+            return _candles()
+
+    monkeypatch.setattr(
+        "gemini_stock.main.maybe_send_movement_alerts",
+        lambda settings, db, technical_snapshot, candles_1m, profile, trading_date=None, window_minutes=10: captured.update(
+            {
+                "profile": profile,
+                "window_minutes": window_minutes,
+                "symbol": technical_snapshot,
+            }
+        )
+        or 0,
+    )
+
+    settings = Settings(movement_alert_symbols=["BTC-USD"])
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+
+    run_movement_only_symbol(
+        "BTC-USD",
+        settings,
+        db,
+        context=SimpleNamespace(data_provider=FakeProvider()),
+        trading_date="2026-01-05",
+    )
+
+    assert captured == {"profile": "crypto", "window_minutes": 30, "symbol": "BTC-USD"}

@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 import yfinance as yf
 
-from gemini_stock.benchmarks import build_benchmark_forecast
 from gemini_stock.config import load_settings
 from gemini_stock.health import evaluate_worker_health
 from gemini_stock.schedule import get_schedule_decision
@@ -37,9 +36,11 @@ class DashboardRepository:
         settings = load_settings()
         latest_feature_time = self._latest_created_at("features")
         latest_llm_time = self._latest_created_at("llm_outputs")
-        countdown_seconds = self._seconds_until_next_run(latest_llm_time, decision.interval_seconds, decision.should_run)
+        latest_alert_time = self._latest_created_at("alerts")
+        latest_worker_activity_time = _max_timestamp(latest_feature_time, latest_llm_time, latest_alert_time)
+        countdown_seconds = self._seconds_until_next_run(latest_worker_activity_time, decision.interval_seconds, decision.should_run)
         worker_health = evaluate_worker_health(
-            latest_llm_time,
+            latest_worker_activity_time,
             decision,
             stale_after_intervals=settings.worker_stale_after_intervals,
         )
@@ -53,6 +54,8 @@ class DashboardRepository:
             "config_warnings": find_secret_config_warnings(".env"),
             "latest_feature_at": to_beijing_time(latest_feature_time),
             "latest_llm_at": to_beijing_time(latest_llm_time),
+            "latest_alert_at": to_beijing_time(latest_alert_time),
+            "latest_worker_activity_at": to_beijing_time(latest_worker_activity_time),
             "database_path": str(self.database_path),
         }
 
@@ -143,68 +146,7 @@ class DashboardRepository:
             )
         return states
 
-    def get_benchmark_states(self, symbols: list[str]) -> list[dict[str, Any]]:
-        states = []
-        for symbol in symbols:
-            feature = self._latest_row("features", symbol)
-            llm = self._latest_row("llm_outputs", symbol)
-            feature_payload = self._json(feature, "payload_json") if feature else {}
-            llm_output = self._json(llm, "output_json") if llm and llm["output_json"] else {}
-            latest_1m = self._latest_raw_candle(symbol, "1m")
-            quote = _stored_quote_snapshot(feature_payload, latest_1m)
-            close = quote.get("regular_market_price") or feature_payload.get("close")
-            forecast = None
-            if feature_payload and llm_output:
-                try:
-                    from gemini_stock.schemas import GeminiSignal, TechnicalSnapshot
-
-                    snapshot = TechnicalSnapshot.model_validate(feature_payload)
-                    signal = GeminiSignal.model_validate(llm_output)
-                    forecast = build_benchmark_forecast(snapshot, signal)
-                except Exception:
-                    forecast = None
-
-            support_levels = feature_payload.get("support_levels") or []
-            resistance_levels = feature_payload.get("resistance_levels") or []
-            nearest_support = forecast.support_level if forecast else _nearest_level_for_view(support_levels, close, "support")
-            nearest_resistance = (
-                forecast.resistance_level if forecast else _nearest_level_for_view(resistance_levels, close, "resistance")
-            )
-            states.append(
-                {
-                    "symbol": symbol,
-                    "regular_market_price": close,
-                    "regular_market_time": to_beijing_time(quote.get("regular_market_time"))
-                    or to_beijing_time(feature_payload.get("timestamp_utc")),
-                    "bias": llm_output.get("bias"),
-                    "sentiment_score": llm_output.get("sentiment_score"),
-                    "confidence": llm_output.get("confidence"),
-                    "support_level": nearest_support,
-                    "resistance_level": nearest_resistance,
-                    "day_range": _format_price_range(forecast.day_range_low, forecast.day_range_high)
-                    if forecast and forecast.day_range_low is not None and forecast.day_range_high is not None
-                    else "-",
-                    "rsi_14": feature_payload.get("rsi_14"),
-                    "ema_20": feature_payload.get("ema_20"),
-                    "ema_50": feature_payload.get("ema_50"),
-                    "expected_move": forecast.expected_move if forecast else _expected_move(llm_output.get("bias"), close, nearest_support, nearest_resistance),
-                    "outlook_note": forecast.outlook_note
-                    if forecast
-                    else _outlook_note(
-                        llm_output.get("bias"),
-                        close,
-                        nearest_support,
-                        nearest_resistance,
-                        feature_payload.get("rsi_14"),
-                    ),
-                    "upside_scenario": forecast.upside_scenario if forecast else None,
-                    "downside_scenario": forecast.downside_scenario if forecast else None,
-                    "rebound_scenario": forecast.rebound_scenario if forecast else None,
-                }
-            )
-        return states
-
-    def build_priority_views(self, symbols: list[str], benchmarks: list[str]) -> dict[str, list[dict[str, Any]]]:
+    def build_priority_views(self, symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
         symbol_states = self.get_symbol_states(symbols)
         return {
             "most_urgent": _rank_most_urgent(symbol_states)[:3],
@@ -431,6 +373,13 @@ def _seconds_to_delta(seconds: int):
     return timedelta(seconds=seconds)
 
 
+def _max_timestamp(*values: str | None) -> str | None:
+    normalized = [_parse_datetime(value) for value in values if value]
+    if not normalized:
+        return None
+    return max(normalized).isoformat()
+
+
 def format_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     hours, remainder = divmod(seconds, 3600)
@@ -532,8 +481,6 @@ def _alert_category(alert_type: str | None, setup_type: str | None) -> str:
         return "到价提醒"
     if alert_type == "movement_alert" or setup_type in {"fast_drop", "fast_rise", "movement_alert"}:
         return "价格异动"
-    if alert_type == "benchmark_alert":
-        return "大盘观察"
     if alert_type == "primary_alert":
         return "AI 盯盘"
     return "系统记录"
@@ -673,42 +620,3 @@ def _priority_explanation(state: dict[str, Any], distance_label: str) -> str:
         reasons.append("当前关注度相对更高")
     return "，且".join(reasons[:3]) if len(reasons) > 1 else reasons[0]
 
-
-def _expected_move(bias: str | None, close: float | None, support: float | None, resistance: float | None) -> str:
-    if close is None:
-        return "等待数据"
-    if bias == "bullish":
-        if resistance is not None and resistance - close <= max(close * 0.003, 0.15):
-            return "上探压力位"
-        return "震荡偏强"
-    if bias == "bearish":
-        if support is not None and close - support <= max(close * 0.003, 0.15):
-            return "下探支撑位"
-        return "震荡偏弱"
-    return "区间震荡"
-
-
-def _outlook_note(
-    bias: str | None,
-    close: float | None,
-    support: float | None,
-    resistance: float | None,
-    rsi_14: float | None,
-) -> str:
-    if close is None:
-        return "等待最新行情。"
-    if bias == "bullish":
-        return (
-            f"价格靠近压力位 {resistance:.2f}，短线留意突破延续。"
-            if resistance is not None and resistance - close <= max(close * 0.003, 0.15)
-            else "均线结构仍偏强，回踩后更适合观察承接。"
-        )
-    if bias == "bearish":
-        return (
-            f"价格靠近支撑位 {support:.2f}，留意是否继续下探。"
-            if support is not None and close - support <= max(close * 0.003, 0.15)
-            else "短线动能偏弱，反弹更适合观察压力确认。"
-        )
-    if rsi_14 is not None and 45 <= rsi_14 <= 55:
-        return "方向不强，当前更像区间拉扯。"
-    return "先看支撑压力的突破方向。"

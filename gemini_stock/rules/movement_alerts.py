@@ -181,8 +181,6 @@ def _symbol_from(symbol_or_snapshot: str | TechnicalSnapshot) -> str:
 
 
 def _movement_title(profile: str) -> str:
-    if profile == "benchmark":
-        return "大盘异动"
     if profile == "crypto":
         return "币种异动"
     return "个股异动"
@@ -190,13 +188,9 @@ def _movement_title(profile: str) -> str:
 
 def _movement_action(profile: str, event_type: str) -> str:
     if event_type == "fast_rise":
-        if profile == "benchmark":
-            return "先看大盘持续性，不追高；已有盈利看分批止盈。"
         if profile == "crypto":
             return "先看加密市场持续性，避免追高或情绪加仓。"
         return "先看是否进入止盈/压力区，不追价；已有盈利可分批处理。"
-    if profile == "benchmark":
-        return "先看大盘承接，再判断个股信号。"
     if profile == "crypto":
         return "先看加密市场承接，避免追空或抢反弹。"
     return "先观察承接，不追空；等二次确认。"
@@ -207,9 +201,7 @@ def _movement_move_label(event_type: str) -> str:
 
 
 def _movement_tip(profile: str, with_prefix: bool) -> str:
-    if profile == "benchmark":
-        text = "只看环境，不替代个股判断。"
-    elif profile == "crypto":
+    if profile == "crypto":
         text = "仅价格异动提醒，不进入股票 AI 分析。"
     else:
         text = "仅研究提醒，注意仓位和大盘环境。"

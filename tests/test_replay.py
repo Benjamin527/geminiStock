@@ -151,3 +151,27 @@ def test_format_daily_review_includes_score_and_learning_notes():
     assert "学习：" in text
     assert "结论：观察｜先记录 L1，等待二次握手，不为交易而交易。" in text
     assert len(text.splitlines()) <= 8
+
+
+def test_daily_review_learning_notes_include_regime_and_tail_session_memory(tmp_path):
+    db = Database(tmp_path / "signals.db")
+    db.initialize()
+    trade_date = datetime(2026, 1, 5, tzinfo=timezone.utc).date()
+    start = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    db.save_llm_output(
+        "TSLL",
+        {"technical_snapshot": {"timestamp_utc": start.isoformat()}},
+        _signal("TSLL", start).json_dict(),
+        None,
+    )
+    db.save_candles(
+        [
+            Candle(symbol="TSLL", interval="1m", timestamp_utc=start, open=10.0, high=10.1, low=10.0, close=10.05, volume=1000),
+            Candle(symbol="TSLL", interval="1m", timestamp_utc=start + timedelta(minutes=45), open=9.95, high=10.0, low=9.7, close=9.72, volume=1500),
+        ]
+    )
+
+    review = build_daily_review(db, ["TSLL"], trade_date)
+
+    assert any("模式" in note for note in review.learning_notes)
+    assert any("3:30 pm" in note for note in review.learning_notes)

@@ -150,7 +150,7 @@ def test_dashboard_page_shows_direction_and_targets_on_symbol_cards(tmp_path, mo
     db.initialize()
     db.save_feature(_snapshot())
     db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"])
 
     response = TestClient(app).get("/")
 
@@ -202,7 +202,7 @@ def test_dashboard_shows_non_actionable_trade_ranges_as_observe_only(tmp_path, m
         ).json_dict(),
         None,
     )
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"])
 
     response = TestClient(app).get("/")
 
@@ -244,7 +244,7 @@ def test_dashboard_page_renders_core_sections(tmp_path, monkeypatch):
     db.initialize()
     db.save_feature(_snapshot())
     db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"])
 
     response = TestClient(app).get("/")
 
@@ -260,45 +260,26 @@ def test_dashboard_page_renders_core_sections(tmp_path, monkeypatch):
     assert 'class="mobile-tabs"' in response.text
 
 
-def test_dashboard_page_uses_coinbase_template_assets(tmp_path, monkeypatch):
+def test_dashboard_page_uses_dashboard_template_assets(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
     db = Database(tmp_path / "dashboard.db")
     db.initialize()
     db.save_feature(_snapshot())
     db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"])
 
     response = TestClient(app).get("/")
 
     assert response.status_code == 200
-    assert 'data-dashboard-shell="coinbase"' in response.text
+    assert 'data-dashboard-shell="binance"' in response.text
     assert '/static/dashboard.css' in response.text
     assert '/static/dashboard.js' in response.text
-    assert "Institutional watch for leveraged AI setups" in response.text
+    assert "High-frequency watch surface for AI momentum names" in response.text
     assert "监控与阈值设置" in response.text
     assert '<meta http-equiv="refresh"' not in response.text
     assert '<script src="/static/dashboard.js"></script>' in response.text
     assert 'id="dashboard-root"' in response.text
     assert 'data-status-endpoint=' not in response.text
-
-
-def test_dashboard_benchmark_cards_show_regular_session_forecast(tmp_path, monkeypatch):
-    monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
-    db = Database(tmp_path / "dashboard.db")
-    db.initialize()
-    db.save_feature(_snapshot())
-    db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=[], benchmark_symbols=["SPY"])
-
-    response = TestClient(app).get("/")
-    payload = TestClient(app).get("/api/status").json()
-
-    assert response.status_code == 200
-    assert "常规盘区间" in response.text
-    assert "走强触发" in response.text
-    assert "走弱触发" in response.text
-    assert "短线" not in response.text
-    assert payload["benchmarks"][0]["day_range"]
 
 
 def test_dashboard_recent_sections_only_show_selected_symbols(tmp_path, monkeypatch):
@@ -308,7 +289,7 @@ def test_dashboard_recent_sections_only_show_selected_symbols(tmp_path, monkeypa
     db.save_feature(_snapshot())
     db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
     db.save_llm_output("QQQ", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "QQQ"}).json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["SPY"])
 
     response = TestClient(app).get("/")
     payload = TestClient(app).get("/api/status").json()
@@ -332,27 +313,20 @@ def test_dashboard_displays_beijing_time(tmp_path, monkeypatch):
     assert payload["symbols"][0]["feature_timestamp"] == "2026-01-05 23:00:00 北京时间"
 
 
-def test_dashboard_renders_benchmark_overview_section(tmp_path, monkeypatch):
+def test_dashboard_hides_benchmark_section_and_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard_repository, "_fetch_quote_snapshot", lambda symbol: _quote_snapshot())
     db = Database(tmp_path / "dashboard.db")
     db.initialize()
-    db.save_feature(_snapshot().model_copy(update={"symbol": "SPY", "close": 100.5, "support_levels": [99.8, 99.0], "resistance_levels": [101.2, 102.0]}))
-    db.save_llm_output(
-        "SPY",
-        {"analysis_level": "json_only", "has_image": False},
-        _signal().model_copy(update={"symbol": "SPY", "bias": "bullish", "sentiment_score": 4.5, "confidence": 0.65}).json_dict(),
-        None,
-    )
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["TSLL"], benchmark_symbols=["SPY"])
+    db.save_feature(_snapshot())
+    db.save_llm_output("SPY", {"analysis_level": "json_only", "has_image": False}, _signal().json_dict(), None)
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["TSLL"])
 
     response = TestClient(app).get("/")
     payload = TestClient(app).get("/api/status").json()
 
-    assert "大盘观察" in response.text
-    assert "常规盘区间" in response.text
-    assert "走弱触发" in response.text
-    assert "走强触发" in response.text
-    assert payload["benchmarks"][0]["symbol"] == "SPY"
+    assert "大盘观察" not in response.text
+    assert "常规盘区间" not in response.text
+    assert "benchmarks" not in payload
 
 
 def test_dashboard_api_can_add_watchlist_symbol(tmp_path, monkeypatch):
@@ -428,7 +402,7 @@ def test_dashboard_sorts_primary_symbols_by_urgency(tmp_path, monkeypatch):
     db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
     db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
     db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"])
 
     response = TestClient(app).get("/")
 
@@ -445,7 +419,7 @@ def test_dashboard_api_status_includes_priority_views(tmp_path, monkeypatch):
     db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
     db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
     db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"])
 
     payload = TestClient(app).get("/api/status").json()
 
@@ -464,7 +438,7 @@ def test_dashboard_page_renders_priority_views_at_top(tmp_path, monkeypatch):
     db.save_feature(_snapshot().model_copy(update={"symbol": "HIGH", "close": 10}))
     db.save_llm_output("LOW", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "LOW", "should_alert": False, "sentiment_score": 1.0}).json_dict(), None)
     db.save_llm_output("HIGH", {"analysis_level": "json_only", "has_image": False}, _signal().model_copy(update={"symbol": "HIGH", "should_alert": True, "sentiment_score": 8.0, "confidence": 0.8}).json_dict(), None)
-    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"], benchmark_symbols=[])
+    app = create_app(database_path=db.path, chart_dir=tmp_path, symbols=["LOW", "HIGH"])
 
     response = TestClient(app).get("/")
 

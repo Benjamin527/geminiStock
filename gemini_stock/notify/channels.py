@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from gemini_stock.benchmarks import BenchmarkForecast
 from gemini_stock.schemas import AlertDecision
 
 logger = logging.getLogger(__name__)
@@ -44,10 +43,22 @@ def _action_text(bias: str) -> str:
     return "先观察，等二次握手"
 
 
-def format_alert(decision: AlertDecision) -> str:
-    if decision.reason.startswith("benchmark_"):
-        return format_benchmark_alert(decision)
+def _reason_label(bias: str) -> str:
+    if bias == "bearish":
+        return "卖出原因"
+    if bias == "bullish":
+        return "买入原因"
+    return "观察原因"
 
+
+def _reason_text(reasons: list[str], fallback: str) -> str:
+    cleaned = [item.strip().rstrip("。.;； ") for item in reasons if item and item.strip()]
+    if not cleaned:
+        return fallback
+    return "；".join(cleaned[:2])
+
+
+def format_alert(decision: AlertDecision) -> str:
     signal = decision.signal
     technical = decision.technical_snapshot
     bias_label = {
@@ -64,6 +75,8 @@ def format_alert(decision: AlertDecision) -> str:
     entry_label, stop_label, target_label = _trade_labels(signal.bias)
     target_short = "回补" if signal.bias == "bearish" else "目标"
     stop_short = "风险" if signal.bias == "bearish" else stop_label
+    reason_label = _reason_label(signal.bias)
+    reason_text = _reason_text(signal.reasons, f"当前结构满足 {setup_label} 条件，但仍要先看失效位与仓位约束")
     return "\n".join(
         [
             f"【盯盘提醒】{signal.symbol}｜{bias_label}｜{setup_label}",
@@ -72,58 +85,9 @@ def format_alert(decision: AlertDecision) -> str:
             f"{entry_label.replace('参考', '')} {_format_band(signal.entry_zone, signal.bias)}｜{stop_short} {signal.stop_loss:.2f}｜{target_short} {_format_band(signal.take_profit, signal.bias)}",
             f"动作：{_action_text(signal.bias)}",
             "提示：仅研究提醒，破失效位先降风险。",
+            f"{reason_label}：{reason_text}。",
         ]
     )
-
-
-def format_benchmark_alert(decision: AlertDecision) -> str:
-    signal = decision.signal
-    technical = decision.technical_snapshot
-    support = technical.support_levels[0] if technical.support_levels else None
-    resistance = technical.resistance_levels[0] if technical.resistance_levels else None
-    reason_map = {
-        "benchmark_drop_alert": "盘中快速下跌",
-        "benchmark_support_watch": "接近关键支撑位",
-        "benchmark_resistance_watch": "接近关键压力位",
-        "benchmark_trend_alert": "方向信号明显增强",
-    }
-    move_map = {
-        "bullish": "震荡偏强",
-        "bearish": "震荡偏弱",
-        "neutral": "区间震荡",
-    }
-    return "\n".join(
-        [
-            f"【大盘观察】{signal.symbol}｜{reason_map.get(decision.reason, decision.reason)}",
-            "----------------",
-            f"现价 {technical.close:.2f}｜方向 { {'bullish': '偏强', 'bearish': '偏弱', 'neutral': '震荡'}.get(signal.bias, signal.bias) }",
-            f"支撑 {_fmt_or_dash(support)}｜压力 {_fmt_or_dash(resistance)}",
-            f"剧本：{move_map.get(signal.bias, '区间震荡')}",
-            "提示：只看环境，不替代个股判断。",
-        ]
-    )
-
-
-def format_premarket_brief(forecasts: list[BenchmarkForecast], trading_date: str) -> str:
-    lines = [
-        f"【盘前观察】{trading_date}",
-        "----------------",
-    ]
-    for forecast in forecasts:
-        bias_label = {"bullish": "偏强", "bearish": "偏弱", "neutral": "震荡"}.get(forecast.bias, forecast.bias)
-        day_range = (
-            f"{forecast.day_range_low:.2f}-{forecast.day_range_high:.2f}"
-            if forecast.day_range_low is not None and forecast.day_range_high is not None
-            else "-"
-        )
-        lines.extend(
-            [
-                f"{forecast.symbol}｜{bias_label}｜现价 {forecast.current_price:.2f}｜区间 {day_range}",
-                f"触发：破 {_fmt_or_dash(forecast.support_level)} / 上 {_fmt_or_dash(forecast.resistance_level)}",
-            ]
-        )
-    lines.append("提示：开盘后以真实走势为准。")
-    return "\n".join(lines)
 
 
 def format_opening_silence_self_check(

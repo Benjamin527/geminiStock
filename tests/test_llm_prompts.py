@@ -78,3 +78,7 @@ def test_prompts_include_zhaoge_decision_framework():
     assert "失效条件" in prompt
     assert "不追价区" in prompt
     assert "仓位约束" in prompt
+    assert "模式" in prompt
+    assert "3:30 pm" in prompt
+    assert "被动减仓" in prompt
+    assert "zhaoge_context" in prompt
